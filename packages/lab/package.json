@@ -16,6 +16,8 @@
     "build": "bun run clean && bun run build:esm",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix --max-warnings 0",
+    "setup:browser": "playwright install chromium",
+    "setup:browser:ci": "playwright install --with-deps chromium",
     "test:node": "bun test --max-concurrency=1 --timeout 30000 .spec.ts",
     "test:node:coverage": "bun test --max-concurrency=1 --timeout 30000 --coverage --coverage-skip-test-files --coverage-reporter=text --coverage-reporter=lcov --coverage-dir=coverage .spec.ts",
     "typecheck": "bun tsc --noEmit -p tsconfig.json && bun tsc --noEmit -p tests/tsconfig.json"
