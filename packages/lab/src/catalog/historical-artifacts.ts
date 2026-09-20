@@ -47,11 +47,14 @@ const sharedSourceFiles = {
   },
 } as const satisfies Readonly<Record<string, CatalogFilePin>>;
 
-const sourceFiles = Object.values(sharedSourceFiles);
-
 const capabilities = [
   {
-    evidence      : [sharedSourceFiles.didDht, sharedSourceFiles.didDhtPkarr, sharedSourceFiles.dwnServer],
+    evidence: [
+      sharedSourceFiles.didDht,
+      sharedSourceFiles.didDhtPkarr,
+      sharedSourceFiles.dwnServer,
+      sharedSourceFiles.universalResolver,
+    ],
     id            : 'private-did-gateway',
     notes         : 'The SDK accepts an explicit private gateway opt-in and the server accepts resolver injection. The stock launcher can also use its process-scoped DID_DHT_* defaults. Runtime isolation is not yet proved.',
     runtimeStatus : 'pending',
@@ -94,22 +97,11 @@ const build = {
       stages    : ['deps', 'build', 'runtime'],
     },
   ],
-  context    : '.',
-  dockerfile : {
+  dockerfile: {
     gitObject : '6875ab9b14dcb757c8d98adfa51c9cf09170697c',
     path      : 'Dockerfile',
   },
-  installCommand    : ['bun', 'install', '--frozen-lockfile', '--ignore-scripts'],
-  packageBuildOrder : [
-    '@enbox/common',
-    '@enbox/crypto',
-    '@enbox/dids',
-    '@enbox/dwn-sdk-js',
-    '@enbox/dwn-sql-store',
-    '@enbox/dwn-clients',
-    '@enbox/dwn-server-admin-ui',
-    '@enbox/dwn-server',
-  ],
+  installCommand: ['bun', 'install', '--frozen-lockfile', '--ignore-scripts'],
 } as const satisfies HistoricalDwnArtifact['build'];
 
 const launch = {
@@ -171,7 +163,6 @@ export const historicalDwnArtifacts = [
       },
       tree: 'c9645a2fcfc65ffac90786da9e024dc1eaf8357b',
     },
-    sourceFiles,
     toolchain: { bun: '1.3.14' },
   },
   {
@@ -209,7 +200,6 @@ export const historicalDwnArtifacts = [
       },
       tree: '559c95854eea23892fa7c4efc3121b0e30fbb5d0',
     },
-    sourceFiles,
     toolchain: { bun: '1.3.14' },
   },
 ] as const satisfies readonly HistoricalDwnArtifact[];

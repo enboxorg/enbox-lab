@@ -24,16 +24,24 @@ export type LabDoctorDependencies = {
 };
 
 async function runCommand(command: string[]): Promise<CommandResult> {
-  const process = Bun.spawn(command, {
-    stderr : 'pipe',
-    stdout : 'pipe',
-  });
-  const [exitCode, stderr, stdout] = await Promise.all([
-    process.exited,
-    new Response(process.stderr).text(),
-    new Response(process.stdout).text(),
-  ]);
-  return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  try {
+    const process = Bun.spawn(command, {
+      stderr : 'pipe',
+      stdout : 'pipe',
+    });
+    const [exitCode, stderr, stdout] = await Promise.all([
+      process.exited,
+      new Response(process.stderr).text(),
+      new Response(process.stdout).text(),
+    ]);
+    return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  } catch (error: unknown) {
+    return {
+      exitCode : -1,
+      stderr   : error instanceof Error ? error.message : String(error),
+      stdout   : '',
+    };
+  }
 }
 
 function commandCheck(id: string, name: string, result: CommandResult): LabCheck {
@@ -85,10 +93,9 @@ export async function runDoctor(dependencies: LabDoctorDependencies = {}): Promi
   const platform = dependencies.platform ?? process.platform;
   const browserExecutablePath = dependencies.browserExecutablePath ?? chromium.executablePath();
 
-  const [bunVersion, dockerVersion, composeVersion, chromiumCheck] = await Promise.all([
+  const [bunVersion, dockerVersion, chromiumCheck] = await Promise.all([
     runner(['bun', '--version']),
     runner(['docker', 'version', '--format', '{{.Client.Version}}/{{.Server.Version}}']),
-    runner(['docker', 'compose', 'version', '--short']),
     browserCheck(browserExecutablePath),
   ]);
 
@@ -102,7 +109,6 @@ export async function runDoctor(dependencies: LabDoctorDependencies = {}): Promi
   const checks: LabCheck[] = [
     bunCheck,
     commandCheck('docker-engine', 'Docker Engine', dockerVersion),
-    commandCheck('docker-compose', 'Docker Compose', composeVersion),
     chromiumCheck,
     {
       details : { architecture, platform },

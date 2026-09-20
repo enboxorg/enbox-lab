@@ -4,6 +4,7 @@ import type { LabCheck, LabProofReport } from '../proof-result.js';
 import { createHash } from 'node:crypto';
 import { createProofReport } from '../proof-result.js';
 import { historicalDwnArtifacts } from './historical-artifacts.js';
+import { immutableBaseImageIssues } from './dockerfile.js';
 
 export type CatalogPreflightMode = 'fixture' | 'source';
 
@@ -88,7 +89,8 @@ function uniquePins(artifact: HistoricalDwnArtifact): CatalogFilePin[] {
     artifact.source.rootPackageJson,
     artifact.dependencyLock,
     artifact.build.dockerfile,
-    ...artifact.sourceFiles,
+    ...(artifact.launch.customLauncher === null ? [] : [artifact.launch.customLauncher]),
+    ...artifact.capabilities.flatMap(({ evidence }): readonly CatalogFilePin[] => evidence),
   ];
 
   const byPath = new Map<string, CatalogFilePin>();
@@ -223,50 +225,107 @@ function capabilityInventoryCheck(artifact: HistoricalDwnArtifact): LabCheck {
     runtimeStatus : capability.runtimeStatus,
     sourceSupport : capability.sourceSupport,
   }]));
+  const failed = artifact.capabilities
+    .filter(({ runtimeStatus }): boolean => runtimeStatus === 'failed')
+    .map(({ id }): string => id);
 
   return {
-    details : { inventory: JSON.stringify(inventory) },
+    details : { failed: JSON.stringify(failed), inventory: JSON.stringify(inventory) },
     id      : `${artifact.id}.capability-inventory`,
-    status  : 'pass',
-    summary : 'Capability support and pending runtime evidence are recorded explicitly',
+    status  : failed.length === 0 ? 'pass' : 'fail',
+    summary : failed.length === 0
+      ? 'Capability support and pending runtime evidence are recorded explicitly'
+      : 'One or more catalog capabilities have failed runtime qualification',
   };
 }
 
-function fixtureChecks(artifact: HistoricalDwnArtifact): LabCheck[] {
-  const missingDigests = artifact.build.baseImages
-    .filter((image): boolean => image.digest === null)
-    .map((image): string => image.reference);
+function immutableBaseImageCheck(artifact: HistoricalDwnArtifact, dockerfile: Uint8Array | undefined): LabCheck {
+  if (dockerfile === undefined) {
+    return {
+      id      : `${artifact.id}.immutable-base-images`,
+      status  : 'fail',
+      summary : 'Pinned Dockerfile content is unavailable for base-image verification',
+    };
+  }
+
+  const issues = immutableBaseImageIssues(artifact.build.baseImages, new TextDecoder().decode(dockerfile));
+  const invalid = issues.some(({ kind }): boolean => kind === 'invalid');
+  return {
+    details : { reasons: JSON.stringify(issues.map(({ message }): string => message)) },
+    id      : `${artifact.id}.immutable-base-images`,
+    status  : issues.length === 0 ? 'pass' : invalid ? 'fail' : 'unsupported',
+    summary : issues.length === 0
+      ? 'The pinned Dockerfile uses every cataloged base image by immutable digest'
+      : invalid
+        ? 'The pinned Dockerfile does not match the immutable base-image inventory'
+        : 'Historical Dockerfile uses mutable tags and no catalog digest is pinned',
+  };
+}
+
+function runtimeQualificationCheck(artifact: HistoricalDwnArtifact): LabCheck {
+  const requiredProofs = artifact.qualification.requiredProofs
+    .map((proof): string => proof.trim())
+    .filter(Boolean);
+  const evidence = artifact.qualification.evidence
+    .map(({ proof, reference }) => ({ proof: proof.trim(), reference: reference.trim() }))
+    .filter(({ proof, reference }): boolean => proof.length > 0 && reference.length > 0);
+  const evidenceProofs = new Set(evidence.map(({ proof }): string => proof));
+  const evidenceComplete = requiredProofs.length > 0 &&
+    new Set(requiredProofs).size === artifact.qualification.requiredProofs.length &&
+    evidence.length === artifact.qualification.evidence.length && evidence.length === requiredProofs.length &&
+    evidenceProofs.size === evidence.length && requiredProofs.every((proof): boolean => evidenceProofs.has(proof));
+  const qualifiedCapabilities = artifact.capabilities.length > 0 && artifact.capabilities.every((capability): boolean => (
+    capability.runtimeStatus === 'qualified' && capability.sourceSupport !== 'not-established' &&
+    (capability.sourceSupport !== 'custom-launcher-required' || artifact.launch.customLauncher !== null)
+  ));
+
+  let status: LabCheck['status'];
+  if (artifact.qualification.status === 'failed') {
+    status = 'fail';
+  } else if (artifact.qualification.status === 'pending') {
+    status = 'unsupported';
+  } else {
+    status = evidenceComplete && qualifiedCapabilities ? 'pass' : 'fail';
+  }
+
+  return {
+    details: {
+      evidence              : evidence.length,
+      evidenceComplete      : evidenceComplete,
+      qualifiedCapabilities : qualifiedCapabilities,
+      requiredProofs        : requiredProofs.length,
+    },
+    id      : `${artifact.id}.runtime-qualification`,
+    status  : status,
+    summary : status === 'pass'
+      ? 'Every catalog capability and required runtime proof has qualification evidence'
+      : artifact.qualification.status === 'pending'
+        ? 'Runtime qualification is pending; fixture creation must remain blocked'
+        : artifact.qualification.status === 'failed'
+          ? 'Runtime qualification failed'
+          : 'Catalog claims qualification without complete evidence and qualified capabilities',
+  };
+}
+
+function fixtureChecks(artifact: HistoricalDwnArtifact, dockerfile: Uint8Array | undefined): LabCheck[] {
   const customLauncherRequired = artifact.capabilities.some(
     (capability): boolean => capability.sourceSupport === 'custom-launcher-required',
   );
+  const customLauncherMissing = customLauncherRequired && artifact.launch.customLauncher === null;
+  const customLauncherStatus: LabCheck['status'] = customLauncherMissing
+    ? artifact.qualification.status === 'qualified' ? 'fail' : 'unsupported'
+    : 'pass';
 
   return [
-    {
-      details : { references: JSON.stringify(missingDigests) },
-      id      : `${artifact.id}.immutable-base-images`,
-      status  : missingDigests.length === 0 ? 'pass' : 'unsupported',
-      summary : missingDigests.length === 0
-        ? 'Every base image has an immutable digest'
-        : 'Historical Dockerfile uses mutable tags and no catalog digest is pinned',
-    },
+    immutableBaseImageCheck(artifact, dockerfile),
     {
       id      : `${artifact.id}.observer-launcher`,
-      status  : customLauncherRequired && artifact.launch.customLauncher === null ? 'unsupported' : 'pass',
-      summary : customLauncherRequired && artifact.launch.customLauncher === null
+      status  : customLauncherStatus,
+      summary : customLauncherMissing
         ? 'Observation hook exists, but no pinned custom launcher installs it'
         : 'Required custom launcher is pinned',
     },
-    {
-      details: {
-        evidence       : artifact.qualification.evidence.length,
-        requiredProofs : artifact.qualification.requiredProofs.length,
-      },
-      id      : `${artifact.id}.runtime-qualification`,
-      status  : artifact.qualification.status === 'qualified' ? 'pass' : 'unsupported',
-      summary : artifact.qualification.status === 'qualified'
-        ? 'Required runtime proofs are qualified'
-        : `Runtime qualification is ${artifact.qualification.status}; fixture creation must remain blocked`,
-    },
+    runtimeQualificationCheck(artifact),
   ];
 }
 
@@ -275,12 +334,13 @@ async function inspectArtifact(
   git: CatalogGitReader,
   mode: CatalogPreflightMode,
 ): Promise<LabCheck[]> {
-  const [commit, tree, pinnedFiles, lock, versions] = await Promise.all([
+  const [commit, tree, pinnedFiles, lock, versions, dockerfile] = await Promise.all([
     git.resolveObject(`${artifact.source.commit}^{commit}`),
     git.resolveObject(`${artifact.source.commit}^{tree}`),
     verifyPinnedFiles(artifact, git),
     verifyLock(artifact, git),
     verifyPackageVersions(artifact, git),
+    mode === 'fixture' ? git.readFile(artifact.source.commit, artifact.build.dockerfile.path) : undefined,
   ]);
   const checks = [
     createIdentityCheck(`${artifact.id}.commit`, commit, artifact.source.commit, 'Source commit'),
@@ -291,7 +351,7 @@ async function inspectArtifact(
     capabilityInventoryCheck(artifact),
   ];
 
-  return mode === 'fixture' ? [...checks, ...fixtureChecks(artifact)] : checks;
+  return mode === 'fixture' ? [...checks, ...fixtureChecks(artifact, dockerfile)] : checks;
 }
 
 /** Verifies catalog source pins and, in fixture mode, rejects entries that lack runtime evidence. */

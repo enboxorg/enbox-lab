@@ -3,14 +3,15 @@
 import type { CatalogGitReader } from './catalog-preflight.js';
 import type { Dirent } from 'node:fs';
 import type { HistoricalDwnArtifact } from './types.js';
-import type { LabCheck, LabProofReport, LabProofStatus } from '../proof-result.js';
+import type { LabCheck, LabProofReport } from '../proof-result.js';
 
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { link, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm } from 'node:fs/promises';
 
-import { createProofReport } from '../proof-result.js';
 import { createCatalogGitReader, runCatalogPreflight } from './catalog-preflight.js';
+import { createProofReport, exitCodeForProofStatus } from '../proof-result.js';
+import { dockerfileRunsCommand, immutableBaseImageIssues } from './dockerfile.js';
 import { getHistoricalDwnArtifact, historicalDwnArtifacts } from './historical-artifacts.js';
 
 export type CatalogCommandResult = {
@@ -95,7 +96,6 @@ type DockerImageInspect = {
 };
 
 const IMAGE_ID_PATTERN = /^sha256:[a-f0-9]{64}$/u;
-const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 
 const usage = `bun packages/lab/src/cli.ts prepare --artifact <id> --output <path> --repository <path> [options]
 
@@ -262,6 +262,10 @@ function safeArtifactId(id: string): string {
   return value;
 }
 
+function preparationRoot(outputRoot: string, artifactId: string, buildKey: string): string {
+  return join(resolve(outputRoot), safeArtifactId(artifactId), buildKey);
+}
+
 async function resolvePotentialPath(path: string, symlinkDepth = 0): Promise<string> {
   if (symlinkDepth > 40) {
     throw new Error(`Too many symbolic links while resolving '${path}'`);
@@ -386,74 +390,34 @@ async function materializeSource(
   options: HistoricalArtifactBuildOptions,
   materializer: CatalogSourceMaterializer,
 ): Promise<MaterializationResult> {
-  const artifactRoot = join(resolve(options.outputRoot), safeArtifactId(artifact.id));
-  const preparationRoot = join(artifactRoot, buildKey);
-  await mkdir(preparationRoot, { recursive: true });
-  const archivePath = join(preparationRoot, 'source.tar');
-  let archiveBytes: Buffer;
-
+  const artifactPreparationRoot = preparationRoot(options.outputRoot, artifact.id, buildKey);
+  await mkdir(artifactPreparationRoot, { recursive: true });
+  const archivePath = join(artifactPreparationRoot, 'source.tar');
+  const stagingRoot = await mkdtemp(join(artifactPreparationRoot, '.materialize-'));
+  const contextPath = join(stagingRoot, 'source');
+  const stagingArchive = join(stagingRoot, 'source.tar');
   try {
-    const archiveStats = await lstat(archivePath);
-    if (!archiveStats.isFile()) {
-      throw new Error(`Cached source archive '${archivePath}' is not a regular file`);
-    }
-    archiveBytes = await readFile(archivePath);
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-    const stagingRoot = await mkdtemp(join(preparationRoot, '.materialize-'));
-    const rawContext = join(stagingRoot, 'source');
-    const stagingArchive = join(stagingRoot, 'source.tar');
-    try {
-      await mkdir(rawContext);
-      await materializer.materialize({
-        commit         : artifact.source.commit,
-        destination    : rawContext,
-        repositoryRoot : options.repositoryRoot,
-      });
-      const sealCommand = ['tar', '-cf', stagingArchive, '-C', rawContext, '.'];
-      expectCommand(sealCommand, await runCommand(sealCommand));
-      archiveBytes = await readFile(stagingArchive);
-      try {
-        await link(stagingArchive, archivePath);
-      } catch (writeError: unknown) {
-        if ((writeError as NodeJS.ErrnoException).code !== 'EEXIST') {
-          throw writeError;
-        }
-        const archiveStats = await lstat(archivePath);
-        if (!archiveStats.isFile()) {
-          throw new Error(`Cached source archive '${archivePath}' is not a regular file`);
-        }
-        archiveBytes = await readFile(archivePath);
-      }
-    } finally {
-      await rm(stagingRoot, { force: true, recursive: true });
-    }
-  }
-
-  const verificationRoot = await mkdtemp(join(preparationRoot, '.verify-'));
-  const verificationArchive = join(verificationRoot, 'source.tar');
-  const contextPath = join(verificationRoot, 'source');
-  try {
-    await Promise.all([
-      mkdir(contextPath),
-      writeFile(verificationArchive, archiveBytes),
-    ]);
-    const extractCommand = ['tar', '-xf', verificationArchive, '-C', contextPath];
-    expectCommand(extractCommand, await runCommand(extractCommand));
-    await rm(verificationArchive, { force: true });
+    await mkdir(contextPath);
+    await materializer.materialize({
+      commit         : artifact.source.commit,
+      destination    : contextPath,
+      repositoryRoot : options.repositoryRoot,
+    });
+    const sealCommand = ['tar', '-cf', stagingArchive, '-C', contextPath, '.'];
+    expectCommand(sealCommand, await runCommand(sealCommand));
+    const archiveBytes = await readFile(stagingArchive);
+    await rename(stagingArchive, archivePath);
     const archiveBuffer = Uint8Array.from(archiveBytes).buffer;
     return {
       archive: new Blob([archiveBuffer]),
       archivePath,
       async cleanup(): Promise<void> {
-        await rm(verificationRoot, { force: true, recursive: true });
+        await rm(stagingRoot, { force: true, recursive: true });
       },
       contextPath,
     };
   } catch (error: unknown) {
-    await rm(verificationRoot, { force: true, recursive: true });
+    await rm(stagingRoot, { force: true, recursive: true });
     throw error;
   }
 }
@@ -502,9 +466,7 @@ async function verifyMaterializedClosure(
     const lockfileVersion = readLockfileVersion(lockContents);
     const lockVersionMatches = lockfileVersion === artifact.dependencyLock.formatVersion;
     const frozenInstall = artifact.build.installCommand.includes('--frozen-lockfile');
-    const normalizedDockerfile = dockerfile.replaceAll(/\\\r?\n/gu, ' ').replaceAll(/\s+/gu, ' ');
-    const installCommand = artifact.build.installCommand.join(' ');
-    const dockerfileUsesInstall = normalizedDockerfile.includes(installCommand);
+    const dockerfileUsesInstall = dockerfileRunsCommand(dockerfile, artifact.build.installCommand);
     const lockMatches = actualHash === artifact.dependencyLock.sha256;
     const closureMatches = lockMatches && lockVersionMatches && frozenInstall && dockerfileUsesInstall;
 
@@ -535,64 +497,21 @@ async function verifyMaterializedClosure(
   }
 }
 
-type DockerfileBase = {
-  alias: string | undefined;
-  reference: string;
-};
-
-function dockerfileBases(dockerfile: string): DockerfileBase[] {
-  const bases: DockerfileBase[] = [];
-  const pattern = /^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$/gimu;
-  for (const match of dockerfile.matchAll(pattern)) {
-    bases.push({ alias: match[2]?.toLowerCase(), reference: match[1] });
-  }
-  return bases;
-}
-
 function immutableInputCheck(artifact: HistoricalDwnArtifact, dockerfile: string): LabCheck {
-  const reasons: string[] = [];
-  const knownStages = new Set<string>();
-  const bases = dockerfileBases(dockerfile);
-  if (bases.length === 0) {
-    reasons.push('Dockerfile has no readable FROM instruction');
-  }
-
-  for (const base of bases) {
-    if (base.reference === 'scratch' || knownStages.has(base.reference.toLowerCase())) {
-      if (base.alias !== undefined) {
-        knownStages.add(base.alias);
-      }
-      continue;
-    }
-    const catalogBase = artifact.build.baseImages.find((candidate): boolean => (
-      (base.alias !== undefined && candidate.stages.some((stage): boolean => stage.toLowerCase() === base.alias)) ||
-      candidate.reference === base.reference ||
-      (candidate.digest !== null && `${candidate.reference}@${candidate.digest}` === base.reference)
-    ));
-    if (catalogBase === undefined) {
-      reasons.push(`FROM ${base.reference} is absent from the catalog base-image inventory`);
-    } else if (catalogBase.digest === null) {
-      reasons.push(`${catalogBase.reference} has no catalog digest`);
-    } else if (!SHA256_PATTERN.test(catalogBase.digest)) {
-      reasons.push(`${catalogBase.reference} has malformed digest '${catalogBase.digest}'`);
-    } else if (base.reference !== `${catalogBase.reference}@${catalogBase.digest}`) {
-      reasons.push(`FROM ${base.reference} does not use catalog digest ${catalogBase.digest}`);
-    }
-    if (base.alias !== undefined) {
-      knownStages.add(base.alias);
-    }
-  }
+  const issues = immutableBaseImageIssues(artifact.build.baseImages, dockerfile);
+  const invalid = issues.some(({ kind }): boolean => kind === 'invalid');
 
   return {
     details: {
-      bases   : JSON.stringify(bases),
-      reasons : JSON.stringify(reasons),
+      reasons: JSON.stringify(issues.map(({ message }): string => message)),
     },
     id      : `${artifact.id}.immutable-image-inputs`,
-    status  : reasons.length === 0 ? 'pass' : 'unsupported',
-    summary : reasons.length === 0
+    status  : issues.length === 0 ? 'pass' : invalid ? 'fail' : 'unsupported',
+    summary : issues.length === 0
       ? 'Every external Dockerfile base is selected by an immutable catalog digest'
-      : 'Historical Dockerfile cannot produce an immutable catalog image without changing its source recipe',
+      : invalid
+        ? 'Dockerfile base images do not match the immutable catalog inventory'
+        : 'Historical Dockerfile cannot produce an immutable catalog image without changing its source recipe',
   };
 }
 
@@ -737,15 +656,17 @@ export async function prepareHistoricalArtifact(
   const checks: LabCheck[] = [];
   let sourceArchivePath: string | null = null;
   const projectRoot = options.projectRoot ?? resolve(import.meta.dir, '../../../..');
+  const artifactPreparationRoot = preparationRoot(options.outputRoot, artifact.id, buildKey);
 
   const [insideProject, insideSourceRepository] = await Promise.all([
-    outputIsInsideRepository(options.outputRoot, projectRoot),
-    outputIsInsideRepository(options.outputRoot, options.repositoryRoot),
+    outputIsInsideRepository(artifactPreparationRoot, projectRoot),
+    outputIsInsideRepository(artifactPreparationRoot, options.repositoryRoot),
   ]);
   if (insideProject || insideSourceRepository) {
     checks.push({
       details: {
         outputRoot       : resolve(options.outputRoot),
+        preparationRoot  : resolve(artifactPreparationRoot),
         projectRoot      : resolve(projectRoot),
         sourceRepository : resolve(options.repositoryRoot),
       },
@@ -758,6 +679,7 @@ export async function prepareHistoricalArtifact(
   checks.push({
     details: {
       outputRoot       : resolve(options.outputRoot),
+      preparationRoot  : resolve(artifactPreparationRoot),
       projectRoot      : resolve(projectRoot),
       sourceRepository : resolve(options.repositoryRoot),
     },
@@ -864,13 +786,6 @@ function printBuildResult(result: HistoricalArtifactBuildResult): void {
   }
 }
 
-function exitCodeForStatus(status: LabProofStatus): number {
-  if (status === 'pass') {
-    return 0;
-  }
-  return status === 'unsupported' ? 2 : 1;
-}
-
 /** Runs the standalone historical artifact preparation harness. */
 export async function runHistoricalArtifactBuildCli(args: string[]): Promise<number> {
   if (args.includes('--help') || args.includes('-h')) {
@@ -897,7 +812,7 @@ export async function runHistoricalArtifactBuildCli(args: string[]): Promise<num
   } else {
     printBuildResult(result);
   }
-  return exitCodeForStatus(result.status);
+  return exitCodeForProofStatus(result.status);
 }
 
 if (import.meta.main) {

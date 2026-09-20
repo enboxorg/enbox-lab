@@ -52,4 +52,60 @@ describe('P0 routing proof', () => {
       status : 'unsupported',
     })]);
   });
+
+  it('should fail cleanup when Docker cannot verify owned resources', async () => {
+    const report = await runRoutingProof({
+      now        : (): Date => new Date('2026-09-20T12:00:00.000Z'),
+      randomUuid : (): string => '11111111-1111-4111-8111-111111111111',
+      runCommand : async (command): Promise<{ exitCode: number; stderr: string; stdout: string }> => {
+        if (command[1] === 'version') {
+          return { exitCode: 0, stderr: '', stdout: '{"Server":{"Version":"test"}}' };
+        }
+        if (command[1] === 'build') {
+          return { exitCode: 1, stderr: 'build failed', stdout: '' };
+        }
+        if (command[1] === 'ps' || command[2] === 'ls') {
+          return { exitCode: 1, stderr: 'permission denied', stdout: '' };
+        }
+        return { exitCode: 1, stderr: 'Error: No such object', stdout: '' };
+      },
+      workspaceRoot: process.cwd(),
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      id     : 'proof-resource-cleanup',
+      status : 'fail',
+    }));
+  });
+
+  it('should refuse an existing generated image name without deleting it', async () => {
+    const commands: string[][] = [];
+    const report = await runRoutingProof({
+      now        : (): Date => new Date('2026-09-20T12:00:00.000Z'),
+      randomUuid : (): string => '11111111-1111-4111-8111-111111111111',
+      runCommand : async (command): Promise<{ exitCode: number; stderr: string; stdout: string }> => {
+        commands.push(command);
+        if (command[1] === 'version') {
+          return { exitCode: 0, stderr: '', stdout: '{"Server":{"Version":"test"}}' };
+        }
+        if (command[1] === 'image' && command[2] === 'inspect') {
+          return { exitCode: 0, stderr: '', stdout: '[{"Id":"sha256:existing"}]' };
+        }
+        if (command[1] === 'ps' || command[2] === 'ls') {
+          return { exitCode: 0, stderr: '', stdout: '' };
+        }
+        return { exitCode: 1, stderr: 'Error: No such object', stdout: '' };
+      },
+      workspaceRoot: process.cwd(),
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      details : expect.objectContaining({ error: expect.stringContaining('Refusing to reuse existing Docker image') }),
+      id      : 'routing-proof-execution',
+    }));
+    expect(commands.some((command): boolean => command[1] === 'build')).toBe(false);
+    expect(commands.some((command): boolean => command[1] === 'image' && command[2] === 'rm')).toBe(false);
+  });
 });

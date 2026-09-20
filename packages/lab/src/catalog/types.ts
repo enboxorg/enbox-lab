@@ -20,6 +20,11 @@ export type CatalogCapability = {
   sourceSupport: CatalogSourceSupport;
 };
 
+export type CatalogQualificationEvidence = {
+  proof: string;
+  reference: string;
+};
+
 export type CatalogBaseImage = {
   /** Immutable registry digest. `null` means the historical recipe is not reproducible yet. */
   digest: string | null;
@@ -30,10 +35,8 @@ export type CatalogBaseImage = {
 export type HistoricalDwnArtifact = {
   build: {
     baseImages: readonly CatalogBaseImage[];
-    context: '.';
     dockerfile: CatalogFilePin;
     installCommand: readonly string[];
-    packageBuildOrder: readonly string[];
   };
   capabilities: readonly CatalogCapability[];
   dependencyLock: CatalogFilePin & {
@@ -49,7 +52,7 @@ export type HistoricalDwnArtifact = {
   };
   packages: Readonly<Record<string, CatalogPackagePin>>;
   qualification: {
-    evidence: readonly string[];
+    evidence: readonly CatalogQualificationEvidence[];
     requiredProofs: readonly string[];
     status: CatalogRuntimeStatus;
   };
@@ -59,7 +62,6 @@ export type HistoricalDwnArtifact = {
     rootPackageJson: CatalogFilePin;
     tree: string;
   };
-  sourceFiles: readonly CatalogFilePin[];
   toolchain: {
     bun: string;
   };

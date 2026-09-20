@@ -3,6 +3,7 @@
 import type { CatalogPreflightMode } from './catalog-preflight.js';
 import type { LabCheck, LabProofReport } from '../proof-result.js';
 
+import { exitCodeForProofStatus } from '../proof-result.js';
 import { runCatalogPreflight } from './catalog-preflight.js';
 import { getHistoricalDwnArtifact, historicalDwnArtifacts } from './historical-artifacts.js';
 
@@ -104,7 +105,7 @@ export async function runCatalogPreflightCli(args: string[]): Promise<number> {
   } else {
     printReport(report);
   }
-  return report.status === 'pass' ? 0 : 1;
+  return exitCodeForProofStatus(report.status);
 }
 
 if (import.meta.main) {

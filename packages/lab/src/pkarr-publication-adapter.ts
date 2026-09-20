@@ -4,11 +4,13 @@ const PKARR_SIGNATURE_BYTES = 64;
 const PKARR_SEQUENCE_BYTES = 8;
 const PKARR_PACKET_MIN_BYTES = PKARR_SIGNATURE_BYTES + PKARR_SEQUENCE_BYTES;
 export const PKARR_PACKET_MAX_BYTES = PKARR_PACKET_MIN_BYTES + 1000;
+export const PKARR_MAX_PUBLICATIONS = 1_024;
 const MAX_BEP44_SEQUENCE = 0x7fff_ffff_ffff_ffffn;
 
 export type PkarrPublicationAdapterOptions = {
   fetch?: PkarrFetch;
   journal: PkarrPublicationStore;
+  maxPublications?: number;
   now?: () => Date;
   requestTimeoutMs?: number;
   upstreamBaseUrl: string;
@@ -23,24 +25,20 @@ export type PkarrRestoreResult = {
   status: 'failed' | 'restored';
 };
 
-class KeyedSerialQueue {
-  private readonly _tails = new Map<string, Promise<void>>();
+class SerialQueue {
+  private _tail = Promise.resolve();
 
-  public async run<T>(key: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this._tails.get(key) ?? Promise.resolve();
+  public async run<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this._tail;
     let release = (): void => {};
     const current = new Promise<void>((resolve): void => { release = resolve; });
-    const tail = previous.catch((): void => {}).then((): Promise<void> => current);
-    this._tails.set(key, tail);
+    this._tail = current;
 
-    await previous.catch((): void => {});
+    await previous;
     try {
       return await operation();
     } finally {
       release();
-      if (this._tails.get(key) === tail) {
-        this._tails.delete(key);
-      }
     }
   }
 }
@@ -114,12 +112,16 @@ function identifierFromRequest(request: Request): string | undefined {
   return segments.length === 1 ? segments[0] : undefined;
 }
 
-function copyResponse(response: Response, body: ArrayBuffer): Response {
-  return new Response(body, {
-    headers    : response.headers,
-    status     : response.status,
-    statusText : response.statusText,
-  });
+function upstreamBaseUrl(value: string): URL {
+  const url = new URL(value);
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username !== '' || url.password !== '' ||
+    url.search !== '' || url.hash !== '') {
+    throw new TypeError('Pkarr upstream base URL must use HTTP(S) without credentials, a query, or a fragment.');
+  }
+  if (!url.pathname.endsWith('/')) {
+    url.pathname = `${url.pathname}/`;
+  }
+  return url;
 }
 
 /**
@@ -131,10 +133,12 @@ export class PkarrPublicationAdapter {
   private readonly _activeOperations = new Set<Promise<unknown>>();
   private readonly _upstreamControllers = new Set<AbortController>();
   private readonly _journal: PkarrPublicationStore;
+  private readonly _maxPublications: number;
   private readonly _now: () => Date;
-  private readonly _queue = new KeyedSerialQueue();
+  private readonly _queue = new SerialQueue();
   private readonly _requestTimeoutMs: number;
   private readonly _upstreamBaseUrl: URL;
+  private _lastJournalError?: string;
   private _lastMaintenanceError?: string;
   private _lastUpstreamError?: string;
   private _accepting = true;
@@ -144,11 +148,15 @@ export class PkarrPublicationAdapter {
   public constructor(options: PkarrPublicationAdapterOptions) {
     this._fetch = options.fetch ?? fetch;
     this._journal = options.journal;
+    this._maxPublications = options.maxPublications ?? PKARR_MAX_PUBLICATIONS;
     this._now = options.now ?? ((): Date => new Date());
     this._requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
-    this._upstreamBaseUrl = new URL(options.upstreamBaseUrl);
+    this._upstreamBaseUrl = upstreamBaseUrl(options.upstreamBaseUrl);
     if (!Number.isSafeInteger(this._requestTimeoutMs) || this._requestTimeoutMs <= 0) {
       throw new RangeError('Pkarr upstream request timeout must be a positive safe integer.');
+    }
+    if (!Number.isSafeInteger(this._maxPublications) || this._maxPublications < 1) {
+      throw new RangeError('Pkarr maximum publication count must be a positive safe integer.');
     }
   }
 
@@ -199,7 +207,7 @@ export class PkarrPublicationAdapter {
       return Response.json({ error: detail }, { status: error instanceof PkarrPacketTooLargeError ? 413 : 400 });
     }
 
-    return this._queue.run(identifier, (): Promise<Response> => this.publish(identifier, sequence, packet));
+    return this._queue.run((): Promise<Response> => this.publish(identifier, sequence, packet));
   }
 
   public get lastMaintenanceError(): string | undefined {
@@ -207,7 +215,7 @@ export class PkarrPublicationAdapter {
   }
 
   public get lastError(): string | undefined {
-    return this._lastMaintenanceError ?? this._lastUpstreamError;
+    return this._lastMaintenanceError ?? this._lastJournalError ?? this._lastUpstreamError;
   }
 
   /** Confirms that the configured upstream is reachable without treating its root status as readiness data. */
@@ -220,11 +228,15 @@ export class PkarrPublicationAdapter {
 
   private async performUpstreamProbe(): Promise<void> {
     try {
-      await this.fetchUpstream(this._upstreamBaseUrl, {
+      const response = await this.fetchUpstream(this._upstreamBaseUrl, {
         method   : 'GET',
         redirect : 'error',
         signal   : AbortSignal.timeout(this._requestTimeoutMs),
       });
+      await response.body?.cancel().catch((): void => {});
+      if (response.status >= 500) {
+        throw new Error(`Pkarr upstream probe returned ${response.status}.`);
+      }
       this._lastUpstreamError = undefined;
     } catch (error: unknown) {
       this._lastUpstreamError = error instanceof Error ? error.message : String(error);
@@ -236,9 +248,19 @@ export class PkarrPublicationAdapter {
     if (!this._accepting) {
       return Promise.reject(new Error('Pkarr publication adapter is stopping.'));
     }
-    return this.track(Promise.all(this._journal.list().map((publication): Promise<PkarrRestoreResult> =>
-      this._queue.run(publication.identifier, (): Promise<PkarrRestoreResult> => this.restoreIdentifier(publication.identifier))
-    )));
+    return this.track(this.restoreAll());
+  }
+
+  private async restoreAll(): Promise<PkarrRestoreResult[]> {
+    const publicationCount = this._journal.count();
+    if (publicationCount > this._maxPublications) {
+      throw new Error(`Pkarr journal contains ${publicationCount} publications, exceeding the configured limit of ${this._maxPublications}.`);
+    }
+    const results: PkarrRestoreResult[] = [];
+    for (const publication of this._journal.list()) {
+      results.push(await this._queue.run((): Promise<PkarrRestoreResult> => this.restoreIdentifier(publication.identifier)));
+    }
+    return results;
   }
 
   public startMaintenance(intervalMs: number): void {
@@ -294,7 +316,13 @@ export class PkarrPublicationAdapter {
   }
 
   private async publish(identifier: string, sequence: bigint, packet: Uint8Array): Promise<Response> {
+    if (!this._accepting) {
+      return Response.json({ error: 'Pkarr publication adapter is stopping' }, { status: 503 });
+    }
     const current = this._journal.get(identifier);
+    if (current === undefined && this._journal.count() >= this._maxPublications) {
+      return Response.json({ error: 'Pkarr durable publication quota is full' }, { status: 507 });
+    }
     if (current !== undefined && sequence < current.sequence) {
       return Response.json({ error: 'publication sequence is older than the durable accepted version' }, { status: 409 });
     }
@@ -307,9 +335,8 @@ export class PkarrPublicationAdapter {
       headers : { 'Content-Type': 'application/octet-stream' },
       method  : 'PUT',
     });
-    const body = await upstream.arrayBuffer();
     if (!upstream.ok) {
-      return copyResponse(upstream, body);
+      return upstream;
     }
 
     try {
@@ -319,8 +346,11 @@ export class PkarrPublicationAdapter {
         packet,
         sequence,
       });
+      this._lastJournalError = undefined;
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error);
+      this._lastJournalError = detail;
+      await upstream.body?.cancel().catch((): void => {});
       return Response.json({
         error   : 'upstream accepted the publication but the durable journal failed',
         outcome : 'unknown',
@@ -328,11 +358,14 @@ export class PkarrPublicationAdapter {
       }, { status: 500 });
     }
 
-    return copyResponse(upstream, body);
+    return upstream;
   }
 
   private async restoreIdentifier(identifier: string): Promise<PkarrRestoreResult> {
     const current = this._journal.get(identifier);
+    if (!this._accepting) {
+      return { detail: 'Pkarr publication adapter is stopping', identifier, sequence: current?.sequence.toString() ?? '', status: 'failed' };
+    }
     if (current === undefined) {
       return { detail: 'publication was removed before replay', identifier, sequence: '', status: 'failed' };
     }
@@ -343,6 +376,7 @@ export class PkarrPublicationAdapter {
         headers : { 'Content-Type': 'application/octet-stream' },
         method  : 'PUT',
       });
+      await response.body?.cancel().catch((): void => {});
       if (!response.ok) {
         return this.restoreFailure(current, `upstream returned ${response.status}`);
       }

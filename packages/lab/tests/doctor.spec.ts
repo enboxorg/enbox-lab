@@ -25,7 +25,7 @@ describe('Lab doctor', () => {
       });
 
       expect(report.status).toBe('pass');
-      expect(report.checks).toHaveLength(5);
+      expect(report.checks).toHaveLength(4);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

@@ -131,11 +131,8 @@ describe('popup provider page to wallet worker boundary', () => {
     });
 
     expect(Object.keys(bound.handle).sort()).toEqual([
-      'binding',
       'expiresAt',
       'id',
-      'requestDigest',
-      'workerInstanceId',
     ]);
     expect(JSON.stringify(bound.handle)).not.toContain(opened.clientDid);
     expect(bound.request.responseKey).not.toHaveProperty('d');

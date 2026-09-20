@@ -9,7 +9,6 @@ import { describe, expect, it } from 'bun:test';
 
 import {
   CONNECT_WORKER_MAX_REQUEST_BYTES,
-  ConnectWorkerBoundary,
   ConnectWorkerBoundaryError,
   ConnectWorkerSessionRegistry,
 } from '../src/proofs/connect/connect-worker-boundary.js';
@@ -58,10 +57,6 @@ function expectBoundaryError(callback: () => unknown, code: ConnectWorkerBoundar
   }
 }
 
-function changeFirstCharacter(value: string): string {
-  return `${value[0] === 'A' ? 'B' : 'A'}${value.slice(1)}`;
-}
-
 describe('connect worker session binding', () => {
   it('should snapshot the displayed request and consume that exact snapshot once', () => {
     const registry = new ConnectWorkerSessionRegistry();
@@ -87,10 +82,8 @@ describe('connect worker session binding', () => {
     const registry = new ConnectWorkerSessionRegistry();
     const handle = bindPopup(registry);
     const mutations: ConnectWorkerSessionHandle[] = [
-      { ...handle, binding: changeFirstCharacter(handle.binding) },
+      { ...handle, id: crypto.randomUUID() },
       { ...handle, expiresAt: handle.expiresAt + 1 },
-      { ...handle, requestDigest: changeFirstCharacter(handle.requestDigest) },
-      { ...handle, workerInstanceId: 'different-worker' },
     ];
 
     for (const tampered of mutations) {
@@ -115,7 +108,7 @@ describe('connect worker session binding', () => {
 
     expectBoundaryError((): unknown => registry.claimForApproval(null as never, handle), 'invalid-context');
     expectBoundaryError((): unknown => registry.claimForApproval(CONTEXT, null as never), 'invalid-session');
-    expectBoundaryError((): unknown => registry.claimForApproval(CONTEXT, { ...handle, binding: 1 } as never), 'invalid-session');
+    expectBoundaryError((): unknown => registry.claimForApproval(CONTEXT, { ...handle, id: 1 } as never), 'invalid-session');
     expectBoundaryError((): unknown => registry.bind(null as never), 'invalid-request');
   });
 
@@ -193,17 +186,13 @@ describe('connect worker session binding', () => {
       request   : spoofedOrigin,
       transport : 'postMessage',
     }), 'invalid-channel');
+
+    expectBoundaryError((): unknown => registry.bind({
+      channel   : { kind: 'relay', requestUri: `${RELAY_ORIGIN}/${'x'.repeat(8_192)}` },
+      context   : CONTEXT,
+      request   : createRequest({ mode: 'direct_post', callbackUrl: `${RELAY_ORIGIN}/connect/callback` }),
+      transport : 'relay',
+    }), 'invalid-channel');
   });
 
-  it('should expose no arbitrary signing or key-export operation', () => {
-    expect(Object.getOwnPropertyNames(ConnectWorkerBoundary.prototype).sort()).toEqual([
-      'approve',
-      'bindPopupRequest',
-      'cancel',
-      'constructor',
-      'deny',
-      'openRelayRequest',
-      'stop',
-    ]);
-  });
 });

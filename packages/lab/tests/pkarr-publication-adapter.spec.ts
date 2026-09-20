@@ -94,13 +94,65 @@ describe('PkarrPublicationAdapter', () => {
     expect(forwarded).toBe(false);
   });
 
+  it('should reject new identifiers after reaching the durable publication quota', async () => {
+    const store = await createJournal();
+    let forwarded = 0;
+    const adapter = new PkarrPublicationAdapter({
+      fetch: async (): Promise<Response> => {
+        forwarded += 1;
+        return new Response(undefined, { status: 204 });
+      },
+      journal         : store,
+      maxPublications : 1,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    expect((await adapter.handle(publicationRequest('key-one', packet(1n)))).status).toBe(204);
+    const overQuota = await adapter.handle(publicationRequest('key-two', packet(1n)));
+
+    expect(overQuota.status).toBe(507);
+    expect(forwarded).toBe(1);
+    expect(store.count()).toBe(1);
+  });
+
+  it('should refuse to restore a journal that exceeds the configured quota', async () => {
+    const store = await createJournal();
+    for (const identifier of ['key-one', 'key-two']) {
+      store.set({
+        acceptedAt : '2026-09-20T12:00:00.000Z',
+        identifier,
+        packet     : packet(1n),
+        sequence   : 1n,
+      });
+    }
+    let forwarded = false;
+    const adapter = new PkarrPublicationAdapter({
+      fetch: async (): Promise<Response> => {
+        forwarded = true;
+        return new Response(undefined, { status: 204 });
+      },
+      journal         : store,
+      maxPublications : 1,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    await expect(adapter.restore()).rejects.toThrow('exceeding the configured limit of 1');
+    expect(forwarded).toBe(false);
+  });
+
   it('should report an unknown outcome when durable storage fails after upstream acceptance', async () => {
+    let durableWritesFail = true;
     const adapter = new PkarrPublicationAdapter({
       fetch   : async (): Promise<Response> => new Response(undefined, { status: 204 }),
       journal : {
-        get  : (): undefined => undefined,
-        list : (): [] => [],
-        set  : (): never => { throw new Error('disk full'); },
+        count : (): number => 0,
+        get   : (): undefined => undefined,
+        list  : (): [] => [],
+        set   : (): void => {
+          if (durableWritesFail) {
+            throw new Error('disk full');
+          }
+        },
       },
       upstreamBaseUrl: 'http://pkarr:15411/',
     });
@@ -112,6 +164,38 @@ describe('PkarrPublicationAdapter', () => {
       detail  : 'disk full',
       outcome : 'unknown',
     });
+    expect(adapter.lastError).toBe('disk full');
+
+    durableWritesFail = false;
+    const recovered = await adapter.handle(publicationRequest('key-one', packet(2n)));
+
+    expect(recovered.status).toBe(204);
+    expect(adapter.lastError).toBeUndefined();
+  });
+
+  it('should reject a server-error response from the startup probe', async () => {
+    const store = await createJournal();
+    const adapter = new PkarrPublicationAdapter({
+      fetch           : async (): Promise<Response> => new Response('unavailable', { status: 503 }),
+      journal         : store,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    await expect(adapter.probeUpstream()).rejects.toThrow('Pkarr upstream probe returned 503');
+    expect(adapter.lastError).toBe('Pkarr upstream probe returned 503.');
+  });
+
+  it('should reject unsafe upstream base URLs', async () => {
+    const store = await createJournal();
+
+    expect((): PkarrPublicationAdapter => new PkarrPublicationAdapter({
+      journal         : store,
+      upstreamBaseUrl : 'http://user:password@pkarr:15411/',
+    })).toThrow('without credentials');
+    expect((): PkarrPublicationAdapter => new PkarrPublicationAdapter({
+      journal         : store,
+      upstreamBaseUrl : 'file:///tmp/pkarr',
+    })).toThrow('must use HTTP(S)');
   });
 
   it('should reject stale and conflicting packets before forwarding after upstream recreation', async () => {
@@ -196,6 +280,54 @@ describe('PkarrPublicationAdapter', () => {
     expect(forwardedSequences.at(-1)).toBe(3n);
   });
 
+  it('should replay retained publications without unbounded request fanout', async () => {
+    const store = await createJournal();
+    for (const identifier of ['key-one', 'key-two']) {
+      store.set({
+        acceptedAt : '2026-09-20T12:00:00.000Z',
+        identifier,
+        packet     : packet(1n),
+        sequence   : 1n,
+      });
+    }
+    let active = 0;
+    let maximumActive = 0;
+    const adapter = new PkarrPublicationAdapter({
+      fetch: async (): Promise<Response> => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await Bun.sleep(1);
+        active -= 1;
+        return new Response(undefined, { status: 204 });
+      },
+      journal         : store,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    expect(await adapter.restore()).toHaveLength(2);
+    expect(maximumActive).toBe(1);
+  });
+
+  it('should not buffer a successful upstream response before recording durability', async () => {
+    const store = await createJournal();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new Uint8Array([1]));
+      },
+    });
+    const adapter = new PkarrPublicationAdapter({
+      fetch           : async (): Promise<Response> => new Response(upstreamBody, { status: 200 }),
+      journal         : store,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    const response = await adapter.handle(publicationRequest('key-one', packet(1n)));
+
+    expect(response.status).toBe(200);
+    expect(store.get('key-one')?.sequence).toBe(1n);
+    await response.body?.cancel();
+  });
+
   it('should serialize publication and replay for the same key using the latest durable packet', async () => {
     const store = await createJournal();
     store.set({
@@ -231,6 +363,36 @@ describe('PkarrPublicationAdapter', () => {
     expect(publishResponse.status).toBe(204);
     expect(restoreResults).toEqual([{ identifier: 'key-one', sequence: '2', status: 'restored' }]);
     expect(bodies).toEqual([packet(2n), packet(2n)]);
+  });
+
+  it('should not start a queued publication after shutdown begins', async () => {
+    const store = await createJournal();
+    let forwarded = 0;
+    let markStarted = (): void => {};
+    const started = new Promise<void>((resolve): void => { markStarted = resolve; });
+    const adapter = new PkarrPublicationAdapter({
+      fetch: async (_input, init): Promise<Response> => {
+        forwarded += 1;
+        markStarted();
+        return await new Promise<Response>((_resolve, reject): void => {
+          init?.signal?.addEventListener('abort', (): void => { reject(init.signal?.reason); }, { once: true });
+        });
+      },
+      journal         : store,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+    const first = adapter.handle(publicationRequest('key-one', packet(1n)));
+    await started;
+    const queued = adapter.handle(publicationRequest('key-two', packet(1n)));
+
+    adapter.beginShutdown();
+    const [firstResponse, queuedResponse] = await Promise.all([first, queued]);
+    await adapter.drain();
+
+    expect(firstResponse.status).toBe(502);
+    expect(queuedResponse.status).toBe(503);
+    expect(forwarded).toBe(1);
+    expect(store.count()).toBe(0);
   });
 
   it('should proxy reads without serving journal contents', async () => {
@@ -273,9 +435,10 @@ describe('PkarrPublicationAdapter', () => {
     const adapter = new PkarrPublicationAdapter({
       fetch   : async (): Promise<Response> => new Response(undefined, { status: 404 }),
       journal : {
-        get  : (): undefined => undefined,
-        list : (): never => { throw new Error('journal unavailable'); },
-        set  : (): void => {},
+        count : (): number => 0,
+        get   : (): undefined => undefined,
+        list  : (): never => { throw new Error('journal unavailable'); },
+        set   : (): void => {},
       },
       upstreamBaseUrl: 'http://pkarr:15411/',
     });

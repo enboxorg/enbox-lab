@@ -8,6 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 
 import { createProofReport } from '../../proof-result.js';
 import { runDidPersistenceProof } from '../did-persistence-proof.js';
+import { dockerResourceIsAbsent, imageMatchesHostArchitecture } from '../docker-proof.js';
 
 type CommandResult = {
   exitCode: number;
@@ -45,7 +46,6 @@ type ImageInspection = {
 };
 
 type NetworkInspection = {
-  Internal?: boolean;
   Labels?: Record<string, string>;
   Options?: Record<string, string>;
 };
@@ -67,16 +67,20 @@ function errorMessage(error: unknown): string {
 }
 
 async function defaultRunCommand(command: string[]): Promise<CommandResult> {
-  const child = Bun.spawn(command, {
-    stderr : 'pipe',
-    stdout : 'pipe',
-  });
-  const [exitCode, stderr, stdout] = await Promise.all([
-    child.exited,
-    new Response(child.stderr).text(),
-    new Response(child.stdout).text(),
-  ]);
-  return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  try {
+    const child = Bun.spawn(command, {
+      stderr : 'pipe',
+      stdout : 'pipe',
+    });
+    const [exitCode, stderr, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ]);
+    return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  } catch (error: unknown) {
+    return { exitCode: -1, stderr: errorMessage(error), stdout: '' };
+  }
 }
 
 async function expectCommand(
@@ -151,12 +155,15 @@ async function defaultWaitForRelay(endpoint: string): Promise<void> {
   let lastError = 'relay did not accept an HTTP connection';
   for (let attempt = 0; attempt < RELAY_READY_ATTEMPTS; attempt += 1) {
     try {
-      await fetch(endpoint, { redirect: 'error', signal: AbortSignal.timeout(1_000) });
-      return;
+      const response = await fetch(endpoint, { redirect: 'error', signal: AbortSignal.timeout(1_000) });
+      if (response.status < 500) {
+        return;
+      }
+      lastError = `relay returned ${response.status}`;
     } catch (error: unknown) {
       lastError = errorMessage(error);
-      await delay(RELAY_READY_DELAY_MS);
     }
+    await delay(RELAY_READY_DELAY_MS);
   }
   throw new Error(`Pkarr relay was not ready at ${endpoint}: ${lastError}`);
 }
@@ -205,9 +212,28 @@ async function removeExactContainer(
   containerName: string,
 ): Promise<void> {
   const result = await runner(['docker', 'rm', '--force', containerName]);
-  if (result.exitCode !== 0 && !/No such|not found|does not exist/i.test(result.stderr)) {
+  if (result.exitCode !== 0 && !dockerResourceIsAbsent(result)) {
     throw new Error(`docker rm --force ${containerName} failed (${result.exitCode}): ${result.stderr || result.stdout || 'no output'}`);
   }
+}
+
+async function findOwnedResources(
+  runner: NonNullable<DidRuntimeProofDependencies['runCommand']>,
+  type: 'container' | 'network',
+  runId: string,
+  ownerId: string,
+): Promise<string[]> {
+  const command = type === 'container'
+    ? ['docker', 'ps', '--all', '--quiet']
+    : ['docker', 'network', 'ls', '--quiet'];
+  const result = await runner([...command,
+    '--filter', `label=${PROOF_LABEL}=${runId}`,
+    '--filter', `label=${OWNER_LABEL}=${ownerId}`,
+  ]);
+  if (result.exitCode !== 0) {
+    throw new Error(`Unable to discover owned DID proof ${type} resources: ${result.stderr || result.stdout || 'no output'}`);
+  }
+  return result.stdout.split('\n').map((entry): string => entry.trim()).filter(Boolean);
 }
 
 async function relayConfig(
@@ -311,8 +337,9 @@ export async function runDidRuntimeProof(dependencies: DidRuntimeProofDependenci
     ])).stdout);
     const digestRecorded = imageInspection.RepoDigests?.includes(PKARR_RELAY_IMAGE) === true;
     const masqueradingDisabled = networkInspection.Options?.['com.docker.network.bridge.enable_ip_masquerade'] === 'false';
+    const nativeImage = imageMatchesHostArchitecture(imageInspection);
     const pinnedTestnet = config.Image === PKARR_RELAY_IMAGE && JSON.stringify(config.Cmd) === JSON.stringify(['pkarr-relay', '--testnet']) &&
-      config.Labels?.[OWNER_LABEL] === ownerId && config.Labels?.[PROOF_LABEL] === runId && masqueradingDisabled &&
+      config.Labels?.[OWNER_LABEL] === ownerId && config.Labels?.[PROOF_LABEL] === runId && masqueradingDisabled && nativeImage &&
       networkInspection.Labels?.[OWNER_LABEL] === ownerId && networkInspection.Labels?.[PROOF_LABEL] === runId;
     checks.push({
       details: {
@@ -324,6 +351,7 @@ export async function runDidRuntimeProof(dependencies: DidRuntimeProofDependenci
         imageDigestRecorded   : digestRecorded,
         imageId               : imageInspection.Id ?? '',
         imageOs               : imageInspection.Os ?? '',
+        nativeImage,
         advertisedDwnEndpoint : `http://localhost:${advertisedActorPort}`,
         egressMasquerading    : !masqueradingDisabled,
         labId,
@@ -379,17 +407,39 @@ export async function runDidRuntimeProof(dependencies: DidRuntimeProofDependenci
     });
   } finally {
     const cleanupErrors: string[] = [];
-    if (containerCreated) {
+    const containers = new Set<string>();
+    try {
+      for (const container of await findOwnedResources(runner, 'container', runId, ownerId)) {
+        containers.add(container);
+      }
+    } catch (error: unknown) {
+      cleanupErrors.push(errorMessage(error));
+    }
+    if (containerCreated && containers.size === 0) {
+      containers.add(containerName);
+    }
+    for (const container of containers) {
       try {
-        await removeExactContainer(runner, containerName);
+        await removeExactContainer(runner, container);
       } catch (error: unknown) {
         cleanupErrors.push(errorMessage(error));
       }
     }
-    if (networkCreated) {
-      const result = await runner(['docker', 'network', 'rm', networkName]);
-      if (result.exitCode !== 0 && !/No such|not found|does not exist/i.test(result.stderr)) {
-        cleanupErrors.push(`docker network rm ${networkName}: ${result.stderr || result.stdout}`);
+    const networks = new Set<string>();
+    try {
+      for (const network of await findOwnedResources(runner, 'network', runId, ownerId)) {
+        networks.add(network);
+      }
+    } catch (error: unknown) {
+      cleanupErrors.push(errorMessage(error));
+    }
+    if (networkCreated && networks.size === 0) {
+      networks.add(networkName);
+    }
+    for (const network of networks) {
+      const result = await runner(['docker', 'network', 'rm', network]);
+      if (result.exitCode !== 0 && !dockerResourceIsAbsent(result)) {
+        cleanupErrors.push(`docker network rm ${network}: ${result.stderr || result.stdout}`);
       }
     }
     if (journalDirectory !== undefined) {
@@ -404,7 +454,8 @@ export async function runDidRuntimeProof(dependencies: DidRuntimeProofDependenci
       runner(['docker', 'inspect', containerName]),
       runner(['docker', 'network', 'inspect', networkName]),
     ]);
-    const cleanupPassed = cleanupErrors.length === 0 && containerInspection.exitCode !== 0 && networkInspection.exitCode !== 0 &&
+    const cleanupPassed = cleanupErrors.length === 0 && dockerResourceIsAbsent(containerInspection) &&
+      dockerResourceIsAbsent(networkInspection) &&
       (journalDirectory === undefined || !existsSync(journalDirectory));
     checks.push({
       details: {

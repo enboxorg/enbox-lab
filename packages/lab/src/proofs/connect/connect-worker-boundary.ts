@@ -1,9 +1,5 @@
-import type { ExecuteConnectApprovalParams } from '@enbox/agent';
 import type { ConnectRequest, ConnectSessionTransport } from '@enbox/connect';
 
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-
-import { executeConnectApproval } from '@enbox/agent';
 import { assertConnectRequest, ConnectProvider } from '@enbox/connect';
 
 /** Maximum lifetime of an unapproved request held by the wallet worker. */
@@ -22,14 +18,13 @@ export const CONNECT_WORKER_MAX_REQUEST_BYTES = 65_536;
 export const CONNECT_WORKER_MAX_JWE_BYTES = 131_072;
 
 const CONNECT_WORKER_REQUEST_KEY_BYTES = 32;
+const CONNECT_WORKER_MAX_ORIGIN_BYTES = 2_048;
+const CONNECT_WORKER_MAX_RELAY_URI_BYTES = 8_192;
 const textEncoder = new TextEncoder();
 
 export type ConnectWorkerSessionHandle = Readonly<{
-  binding: string;
   expiresAt: number;
   id: string;
-  requestDigest: string;
-  workerInstanceId: string;
 }>;
 
 export type ConnectWorkerRequestContext = Readonly<{
@@ -53,14 +48,6 @@ export type BoundConnectWorkerRequest = Readonly<{
   handle: ConnectWorkerSessionHandle;
   request: ConnectRequest;
 }>;
-
-export type ConnectWorkerApprovalParams = {
-  approvedProtocolOverrides?: readonly string[];
-  approvedSessionTtlSeconds?: number;
-  handle: ConnectWorkerSessionHandle;
-  pin?: string;
-  providerDid: string;
-};
 
 type ClaimedConnectWorkerSession = {
   channel: ConnectWorkerChannelBinding;
@@ -108,7 +95,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function cloneAndValidateRequest(request: unknown): { digest: string; request: ConnectRequest } {
+function cloneAndValidateRequest(request: unknown): ConnectRequest {
   let serialized: string | undefined;
   try {
     serialized = JSON.stringify(request);
@@ -136,14 +123,11 @@ function cloneAndValidateRequest(request: unknown): { digest: string; request: C
     throw new ConnectWorkerBoundaryError('invalid-request', `Connect worker rejected an invalid opened request: ${reason}`);
   }
 
-  return {
-    digest  : createHash('sha256').update(serialized).digest('base64url'),
-    request : clonedRecord,
-  };
+  return clonedRecord;
 }
 
 function normalizeHttpOrigin(origin: unknown, field: string): string {
-  if (typeof origin !== 'string') {
+  if (typeof origin !== 'string' || textEncoder.encode(origin).byteLength > CONNECT_WORKER_MAX_ORIGIN_BYTES) {
     throw new ConnectWorkerBoundaryError('invalid-channel', `${field} must be an absolute HTTP(S) URL.`);
   }
   let url: URL;
@@ -160,7 +144,7 @@ function normalizeHttpOrigin(origin: unknown, field: string): string {
 }
 
 function normalizeRelayRequestUri(requestUri: unknown): string {
-  if (typeof requestUri !== 'string') {
+  if (typeof requestUri !== 'string' || textEncoder.encode(requestUri).byteLength > CONNECT_WORKER_MAX_RELAY_URI_BYTES) {
     throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay request URI must be an absolute HTTP(S) URL.');
   }
   let url: URL;
@@ -179,10 +163,6 @@ function normalizeRelayRequestUri(requestUri: unknown): string {
   return url.toString();
 }
 
-function channelBindingValue(channel: ConnectWorkerChannelBinding): string {
-  return channel.kind === 'popup' ? `popup:${channel.dappOrigin}` : `relay:${channel.requestUri}`;
-}
-
 function validateContext(context: unknown): asserts context is ConnectWorkerRequestContext {
   if (!isRecord(context) || typeof context.principalId !== 'string' || context.principalId.length === 0 || context.principalId.length > 256) {
     throw new ConnectWorkerBoundaryError('invalid-context', 'Connect worker principal must be a non-empty bounded string.');
@@ -191,11 +171,8 @@ function validateContext(context: unknown): asserts context is ConnectWorkerRequ
 
 function validateHandle(handle: unknown): asserts handle is ConnectWorkerSessionHandle {
   if (!isRecord(handle) ||
-    typeof handle.binding !== 'string' || handle.binding.length === 0 || handle.binding.length > 256 ||
     !Number.isSafeInteger(handle.expiresAt) || (handle.expiresAt as number) < 0 ||
-    typeof handle.id !== 'string' || handle.id.length === 0 || handle.id.length > 256 ||
-    typeof handle.requestDigest !== 'string' || handle.requestDigest.length === 0 || handle.requestDigest.length > 256 ||
-    typeof handle.workerInstanceId !== 'string' || handle.workerInstanceId.length === 0 || handle.workerInstanceId.length > 256) {
+    typeof handle.id !== 'string' || handle.id.length === 0 || handle.id.length > 256) {
     throw new ConnectWorkerBoundaryError('invalid-session', 'Connect worker session is invalid.');
   }
 }
@@ -203,19 +180,17 @@ function validateHandle(handle: unknown): asserts handle is ConnectWorkerSession
 /**
  * Ephemeral worker-side store for opened connect requests.
  *
- * Handles are authenticated with a per-process HMAC key and bound to the
- * authenticated caller, channel, request digest, expiry, and worker instance.
- * The request is copied at admission and never accepted again during approval,
- * so a consent action cannot replace the request that was displayed. Sessions
- * are one-shot and intentionally disappear on worker restart.
+ * Handles are short-lived random bearer capabilities bound in worker memory to
+ * the authenticated caller, channel, request, and expiry. The request is copied
+ * at admission and never accepted again during approval, so a consent action
+ * cannot replace the request that was displayed. Sessions are one-shot and
+ * intentionally disappear on worker restart.
  */
 export class ConnectWorkerSessionRegistry {
-  private readonly _bindingKey = randomBytes(32);
   private readonly _maxPendingSessions: number;
   private readonly _now: () => number;
   private readonly _sessionTtlMs: number;
   private readonly _sessions = new Map<string, StoredConnectWorkerSession>();
-  private readonly _workerInstanceId = randomBytes(16).toString('base64url');
   private _stopped = false;
 
   public constructor(options: ConnectWorkerSessionRegistryOptions = {}) {
@@ -243,32 +218,20 @@ export class ConnectWorkerSessionRegistry {
       throw new ConnectWorkerBoundaryError('capacity-exceeded', 'Connect worker has reached its pending-session limit.');
     }
 
-    const snapshot = cloneAndValidateRequest(params.request);
-    const { channel, transport } = this.validateChannel(params.channel, snapshot.request, params.transport);
-    const id = randomBytes(24).toString('base64url');
+    const request = cloneAndValidateRequest(params.request);
+    const { channel, transport } = this.validateChannel(params.channel, request, params.transport);
+    const id = crypto.randomUUID();
     const expiresAt = this._now() + this._sessionTtlMs;
-    const unsignedHandle = {
-      expiresAt,
-      id,
-      requestDigest    : snapshot.digest,
-      workerInstanceId : this._workerInstanceId,
-    };
-    const binding = this.createBinding({
-      ...unsignedHandle,
-      channel,
-      principalId: params.context.principalId,
-      transport,
-    });
-    const handle: ConnectWorkerSessionHandle = Object.freeze({ ...unsignedHandle, binding });
+    const handle: ConnectWorkerSessionHandle = Object.freeze({ expiresAt, id });
     this._sessions.set(id, {
       channel,
       handle,
-      principalId : params.context.principalId,
-      request     : snapshot.request,
+      principalId: params.context.principalId,
+      request,
       transport,
     });
 
-    return { handle, request: structuredClone(snapshot.request) };
+    return { handle, request: structuredClone(request) };
   }
 
   /** Opens a direct-encrypted relay request and binds it without exporting the request key. */
@@ -306,10 +269,7 @@ export class ConnectWorkerSessionRegistry {
   }
 
   /** Atomically consumes a session before approval side effects begin. */
-  public claimForApproval(
-    context: ConnectWorkerRequestContext,
-    handle: ConnectWorkerSessionHandle,
-  ): ClaimedConnectWorkerSession {
+  public claimForApproval(context: ConnectWorkerRequestContext, handle: ConnectWorkerSessionHandle): ClaimedConnectWorkerSession {
     return this.consume(context, handle);
   }
 
@@ -324,12 +284,11 @@ export class ConnectWorkerSessionRegistry {
     this.consume(context, handle);
   }
 
-  /** Invalidates every handle and erases the worker's binding key. Idempotent. */
+  /** Invalidates every handle. Idempotent. */
   public stop(): void {
     if (this._stopped) { return; }
     this._stopped = true;
     this._sessions.clear();
-    this._bindingKey.fill(0);
   }
 
   private assertRunning(): void {
@@ -346,75 +305,22 @@ export class ConnectWorkerSessionRegistry {
     validateContext(context);
     validateHandle(handle);
     const session = this._sessions.get(handle.id);
-    if (session === undefined || !this.isAuthenticHandle(context, handle, session)) {
+    if (session === undefined || handle.expiresAt !== session.handle.expiresAt || context.principalId !== session.principalId) {
       throw new ConnectWorkerBoundaryError('invalid-session', 'Connect worker session is invalid.');
     }
 
-    this._sessions.delete(handle.id);
     if (this._now() >= session.handle.expiresAt) {
+      this._sessions.delete(handle.id);
       throw new ConnectWorkerBoundaryError('session-expired', 'Connect worker session has expired.');
     }
+
+    this._sessions.delete(handle.id);
 
     return {
       channel   : session.channel,
       request   : session.request,
       transport : session.transport,
     };
-  }
-
-  private createBinding(params: {
-    channel: ConnectWorkerChannelBinding;
-    expiresAt: number;
-    id: string;
-    principalId: string;
-    requestDigest: string;
-    transport: ConnectSessionTransport;
-    workerInstanceId: string;
-  }): string {
-    return createHmac('sha256', this._bindingKey).update(JSON.stringify([
-      params.workerInstanceId,
-      params.id,
-      params.expiresAt,
-      params.requestDigest,
-      params.principalId,
-      params.transport,
-      channelBindingValue(params.channel),
-    ])).digest('base64url');
-  }
-
-  private isAuthenticHandle(
-    context: ConnectWorkerRequestContext,
-    handle: ConnectWorkerSessionHandle,
-    session: StoredConnectWorkerSession,
-  ): boolean {
-    if (handle.workerInstanceId !== this._workerInstanceId || handle.id !== session.handle.id) {
-      return false;
-    }
-
-    const expected = this.createBinding({
-      channel          : session.channel,
-      expiresAt        : handle.expiresAt,
-      id               : handle.id,
-      principalId      : context.principalId,
-      requestDigest    : handle.requestDigest,
-      transport        : session.transport,
-      workerInstanceId : handle.workerInstanceId,
-    });
-
-    let actualBytes: Buffer;
-    let expectedBytes: Buffer;
-    try {
-      actualBytes = Buffer.from(handle.binding, 'base64url');
-      expectedBytes = Buffer.from(expected, 'base64url');
-    } catch {
-      return false;
-    }
-
-    return handle.expiresAt === session.handle.expiresAt &&
-      handle.requestDigest === session.handle.requestDigest &&
-      context.principalId === session.principalId &&
-      actualBytes.length === expectedBytes.length &&
-      timingSafeEqual(actualBytes, expectedBytes);
   }
 
   private pruneExpired(): void {
@@ -461,94 +367,5 @@ export class ConnectWorkerSessionRegistry {
       throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay callback origin must match the claimed request origin.');
     }
     return { channel: { kind: 'relay', requestUri }, transport };
-  }
-}
-
-/**
- * Narrow page-facing API for one wallet worker.
- *
- * This class deliberately offers only request admission, approval, denial,
- * cancellation, and shutdown. It never returns the worker agent, response
- * signer, wallet private keys, relay request key, or arbitrary signatures.
- */
-export class ConnectWorkerBoundary {
-  private readonly _agent: ExecuteConnectApprovalParams['agent'];
-  private readonly _sessions: ConnectWorkerSessionRegistry;
-
-  public constructor(options: ConnectWorkerSessionRegistryOptions & {
-    agent: ExecuteConnectApprovalParams['agent'];
-  }) {
-    this._agent = options.agent;
-    this._sessions = new ConnectWorkerSessionRegistry(options);
-  }
-
-  /** Binds a request opened by `WalletPostMessageTransport` in the provider page. */
-  public bindPopupRequest(params: {
-    context: ConnectWorkerRequestContext;
-    dappOrigin: string;
-    request: ConnectRequest;
-  }): BoundConnectWorkerRequest {
-    return this._sessions.bind({
-      channel   : { kind: 'popup', dappOrigin: params.dappOrigin },
-      context   : params.context,
-      request   : params.request,
-      transport : 'postMessage',
-    });
-  }
-
-  /** Opens and binds a relay request inside the wallet worker. */
-  public async openRelayRequest(params: {
-    context: ConnectWorkerRequestContext;
-    jwe: string;
-    requestKey: Uint8Array;
-    requestUri: string;
-  }): Promise<BoundConnectWorkerRequest> {
-    return await this._sessions.openRelayRequest(params);
-  }
-
-  /** Runs the real wallet approval ceremony and returns only its sealed response. */
-  public async approve(
-    context: ConnectWorkerRequestContext,
-    params: ConnectWorkerApprovalParams,
-  ): Promise<string> {
-    const session = this._sessions.claimForApproval(context, params.handle);
-    if (session.transport === 'relay' && (params.pin === undefined || params.pin.length === 0)) {
-      throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay approval requires the pairing PIN.');
-    }
-    if (session.transport === 'postMessage' && params.pin !== undefined) {
-      throw new ConnectWorkerBoundaryError('invalid-channel', 'Popup approval must not carry a relay PIN.');
-    }
-
-    const approvalResult = await executeConnectApproval({
-      agent                     : this._agent,
-      approvedProtocolOverrides : params.approvedProtocolOverrides,
-      approvedSessionTtlSeconds : params.approvedSessionTtlSeconds,
-      providerDid               : params.providerDid,
-      request                   : session.request,
-      transport                 : session.transport,
-    });
-    const { responseSigner, ...approval } = approvalResult;
-    return await ConnectProvider.sealApprovedResponse({
-      approval,
-      pin         : params.pin,
-      providerDid : params.providerDid,
-      request     : session.request,
-      signer      : responseSigner,
-    });
-  }
-
-  /** Invalidates a pending request and returns the kernel's opaque denial token. */
-  public deny(context: ConnectWorkerRequestContext, handle: ConnectWorkerSessionHandle): string {
-    return this._sessions.deny(context, handle);
-  }
-
-  /** Invalidates a pending request without emitting a protocol response. */
-  public cancel(context: ConnectWorkerRequestContext, handle: ConnectWorkerSessionHandle): void {
-    this._sessions.cancel(context, handle);
-  }
-
-  /** Invalidates all pending sessions during worker shutdown. */
-  public stop(): void {
-    this._sessions.stop();
   }
 }

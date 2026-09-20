@@ -29,13 +29,11 @@ function createArtifact(immutableBase = false): HistoricalDwnArtifact {
         reference : 'example.invalid/bun:1',
         stages    : ['runtime'],
       }],
-      context    : '.',
-      dockerfile : {
+      dockerfile: {
         gitObject : '4444444444444444444444444444444444444444',
         path      : 'Dockerfile',
       },
-      installCommand    : ['bun', 'install', '--frozen-lockfile', '--ignore-scripts'],
-      packageBuildOrder : ['@enbox/dwn-server'],
+      installCommand: ['bun', 'install', '--frozen-lockfile', '--ignore-scripts'],
     },
     capabilities   : [],
     dependencyLock : {
@@ -71,8 +69,7 @@ function createArtifact(immutableBase = false): HistoricalDwnArtifact {
       },
       tree: '7777777777777777777777777777777777777777',
     },
-    sourceFiles : [],
-    toolchain   : { bun: '1.3.14' },
+    toolchain: { bun: '1.3.14' },
   };
 }
 
@@ -107,6 +104,7 @@ function dockerfile(immutableBase: boolean): string {
 
 function createMaterializer(params: {
   calls: string[];
+  dockerfileContents?: string;
   immutableBase: boolean;
   lock?: Uint8Array;
 }): CatalogSourceMaterializer {
@@ -115,7 +113,7 @@ function createMaterializer(params: {
       params.calls.push(commit);
       await Promise.all([
         writeFile(join(destination, 'bun.lock'), params.lock ?? lockContents),
-        writeFile(join(destination, 'Dockerfile'), dockerfile(params.immutableBase)),
+        writeFile(join(destination, 'Dockerfile'), params.dockerfileContents ?? dockerfile(params.immutableBase)),
       ]);
     },
   };
@@ -202,7 +200,7 @@ describe('Historical artifact build harness', () => {
     expect(result.checks.find((check): boolean => check.id.endsWith('.immutable-image-inputs'))?.status).toBe('unsupported');
   });
 
-  it('should build once, assign a closure-derived tag, and reuse the verified image', async () => {
+  it('should rematerialize source, rebuild, and reuse only the verified content-derived tag', async () => {
     const artifact = createArtifact(true);
     const calls: string[] = [];
     const paths = await createPaths();
@@ -215,6 +213,7 @@ describe('Historical artifact build harness', () => {
     };
 
     const first = await prepareHistoricalArtifact({ artifact, ...paths }, dependencies);
+    await writeFile(first.sourceArchivePath!, 'untrusted cached archive');
     const second = await prepareHistoricalArtifact({ artifact, ...paths }, dependencies);
 
     expect(first.status).toBe('pass');
@@ -225,9 +224,10 @@ describe('Historical artifact build harness', () => {
     );
     expect(second.status).toBe('pass');
     expect(second.image).toEqual(first.image);
-    expect(calls).toEqual([artifact.source.commit]);
+    expect(calls).toEqual([artifact.source.commit, artifact.source.commit]);
     expect(images.buildCalls).toBe(2);
     expect(second.checks.find((check): boolean => check.id.endsWith('.immutable-local-image'))?.details?.tagReused).toBe(true);
+    expect(await readFile(second.sourceArchivePath!, 'utf8')).not.toBe('untrusted cached archive');
   });
 
   it('should fail closed when a deterministic image tag has conflicting closure labels', async () => {
@@ -267,6 +267,33 @@ describe('Historical artifact build harness', () => {
     expect(result.status).toBe('fail');
     expect(images.buildCalls).toBe(0);
     expect(result.checks.find((check): boolean => check.id.endsWith('.materialized-lock-closure'))?.status).toBe('fail');
+  });
+
+  it('should not treat a commented frozen-install command as an executable build step', async () => {
+    const artifact = createArtifact(true);
+    const paths = await createPaths();
+    const images = new FakeImageRuntime();
+    const result = await prepareHistoricalArtifact({ artifact, ...paths }, {
+      git          : createGitReader(artifact),
+      images,
+      materializer : createMaterializer({
+        calls              : [],
+        dockerfileContents : [
+          `FROM example.invalid/bun:1@${pinnedDigest} AS runtime`,
+          'RUN echo ready # bun install --frozen-lockfile --ignore-scripts',
+          '',
+        ].join('\n'),
+        immutableBase: true,
+      }),
+      treeHasher: createTreeHasher(artifact),
+    });
+
+    expect(result.status).toBe('fail');
+    expect(images.buildCalls).toBe(0);
+    expect(result.checks.find((check): boolean => check.id.endsWith('.materialized-lock-closure'))).toMatchObject({
+      details : { dockerfileInstall: false },
+      status  : 'fail',
+    });
   });
 
   it('should reject a sealed context whose complete Git tree differs from the source pin', async () => {
@@ -364,5 +391,53 @@ describe('Historical artifact build harness', () => {
     expect(result.status).toBe('fail');
     expect(calls).toEqual([]);
     expect(result.checks[0].id).toBe('test-server.isolated-output');
+  });
+
+  it('should reject an artifact-directory symlink into the source repository', async () => {
+    const artifact = createArtifact();
+    const paths = await createPaths();
+    const calls: string[] = [];
+    await mkdir(paths.outputRoot);
+    await symlink(paths.repositoryRoot, join(paths.outputRoot, artifact.id), 'dir');
+    const result = await prepareHistoricalArtifact({ artifact, ...paths }, {
+      git          : createGitReader(artifact),
+      materializer : createMaterializer({ calls, immutableBase: false }),
+    });
+
+    expect(result.status).toBe('fail');
+    expect(calls).toEqual([]);
+    expect(result.checks[0]).toMatchObject({
+      id     : 'test-server.isolated-output',
+      status : 'fail',
+    });
+  });
+
+  it('should reject a build-key symlink into the lab project', async () => {
+    const artifact = createArtifact();
+    const paths = await createPaths();
+    const calls: string[] = [];
+    const projectRoot = join(paths.directory, 'enbox-lab');
+    const artifactRoot = join(paths.outputRoot, artifact.id);
+    await Promise.all([
+      mkdir(projectRoot),
+      mkdir(artifactRoot, { recursive: true }),
+    ]);
+    await symlink(projectRoot, join(artifactRoot, getHistoricalArtifactBuildKey(artifact)), 'dir');
+    const result = await prepareHistoricalArtifact({
+      artifact,
+      outputRoot     : paths.outputRoot,
+      projectRoot,
+      repositoryRoot : paths.repositoryRoot,
+    }, {
+      git          : createGitReader(artifact),
+      materializer : createMaterializer({ calls, immutableBase: false }),
+    });
+
+    expect(result.status).toBe('fail');
+    expect(calls).toEqual([]);
+    expect(result.checks[0]).toMatchObject({
+      id     : 'test-server.isolated-output',
+      status : 'fail',
+    });
   });
 });

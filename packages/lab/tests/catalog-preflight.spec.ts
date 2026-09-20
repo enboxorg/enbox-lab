@@ -8,18 +8,21 @@ import { describe, expect, it } from 'bun:test';
 
 const encoder = new TextEncoder();
 const lockContents = encoder.encode('{"lockfileVersion":1}');
+const pinnedDigest = `sha256:${'a'.repeat(64)}`;
+
+function dockerfile(reference = 'example.invalid/bun:mutable'): Uint8Array {
+  return encoder.encode(`FROM ${reference} AS runtime\nRUN bun install --frozen-lockfile\n`);
+}
 
 function createArtifact(): HistoricalDwnArtifact {
   return {
     build: {
       baseImages : [{ digest: null, reference: 'example.invalid/bun:mutable', stages: ['build', 'runtime'] }],
-      context    : '.',
       dockerfile : {
         gitObject : '4444444444444444444444444444444444444444',
         path      : 'Dockerfile',
       },
-      installCommand    : ['bun', 'install', '--frozen-lockfile'],
-      packageBuildOrder : ['@enbox/dwn-server'],
+      installCommand: ['bun', 'install', '--frozen-lockfile'],
     },
     capabilities: [{
       evidence: [{
@@ -64,15 +67,15 @@ function createArtifact(): HistoricalDwnArtifact {
       },
       tree: '7777777777777777777777777777777777777777',
     },
-    sourceFiles: [{
-      gitObject : '5555555555555555555555555555555555555555',
-      path      : 'packages/dwn-server/src/dwn-server.ts',
-    }],
     toolchain: { bun: '1.3.14' },
   };
 }
 
-function createGitReader(artifact: HistoricalDwnArtifact, lock = lockContents): CatalogGitReader {
+function createGitReader(
+  artifact: HistoricalDwnArtifact,
+  lock = lockContents,
+  dockerfileContents = dockerfile(),
+): CatalogGitReader {
   const objects = new Map<string, string>([
     [`${artifact.source.commit}^{commit}`, artifact.source.commit],
     [`${artifact.source.commit}^{tree}`, artifact.source.tree],
@@ -80,10 +83,16 @@ function createGitReader(artifact: HistoricalDwnArtifact, lock = lockContents): 
     [`${artifact.source.commit}:${artifact.dependencyLock.path}`, artifact.dependencyLock.gitObject],
     [`${artifact.source.commit}:${artifact.build.dockerfile.path}`, artifact.build.dockerfile.gitObject],
     [`${artifact.source.commit}:packages/dwn-server`, artifact.packages['@enbox/dwn-server'].sourceTree],
-    ...artifact.sourceFiles.map((pin): [string, string] => [`${artifact.source.commit}:${pin.path}`, pin.gitObject]),
+    ...(artifact.launch.customLauncher === null
+      ? []
+      : [[`${artifact.source.commit}:${artifact.launch.customLauncher.path}`, artifact.launch.customLauncher.gitObject] as [string, string]]),
+    ...artifact.capabilities.flatMap(({ evidence }): Array<[string, string]> => evidence.map(
+      (pin): [string, string] => [`${artifact.source.commit}:${pin.path}`, pin.gitObject],
+    )),
   ]);
   const files = new Map<string, Uint8Array>([
     ['bun.lock', lock],
+    ['Dockerfile', dockerfileContents],
     ['package.json', encoder.encode(JSON.stringify({ packageManager: 'bun@1.3.14' }))],
     ['packages/dwn-server/package.json', encoder.encode(JSON.stringify({ name: '@enbox/dwn-server', version: '1.2.3' }))],
   ]);
@@ -110,8 +119,10 @@ describe('Historical artifact catalog preflight', () => {
 
     expect(report.status).toBe('pass');
     expect(report.checks.every((check): boolean => check.status === 'pass')).toBe(true);
+    expect(report.checks.find((check): boolean => check.id === 'test-server.source-files')?.details?.objects).toBe(5);
     expect(report.checks.find((check): boolean => check.id === 'test-server.capability-inventory')?.details).toEqual({
-      inventory: JSON.stringify({
+      failed    : '[]',
+      inventory : JSON.stringify({
         'message-processed-observer': {
           runtimeStatus : 'pending',
           sourceSupport : 'custom-launcher-required',
@@ -146,6 +157,89 @@ describe('Historical artifact catalog preflight', () => {
       'test-server.observer-launcher',
       'test-server.runtime-qualification',
     ]);
+  });
+
+  it('should preserve failed capability and artifact qualification as failures', async () => {
+    const artifact = createArtifact();
+    artifact.capabilities[0].runtimeStatus = 'failed';
+    artifact.qualification.status = 'failed';
+    const report = await runCatalogPreflight({
+      artifacts : [artifact],
+      git       : createGitReader(artifact),
+      mode      : 'fixture',
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks.find((check): boolean => check.id === 'test-server.capability-inventory')?.status).toBe('fail');
+    expect(report.checks.find((check): boolean => check.id === 'test-server.runtime-qualification')?.status).toBe('fail');
+  });
+
+  it('should reject a qualified label without complete evidence and qualified capabilities', async () => {
+    const artifact = createArtifact();
+    artifact.qualification.status = 'qualified';
+    const report = await runCatalogPreflight({
+      artifacts : [artifact],
+      git       : createGitReader(artifact),
+      mode      : 'fixture',
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks.find((check): boolean => check.id === 'test-server.observer-launcher')?.status).toBe('fail');
+    expect(report.checks.find((check): boolean => check.id === 'test-server.runtime-qualification')).toMatchObject({
+      details : { evidenceComplete: false, qualifiedCapabilities: false },
+      status  : 'fail',
+    });
+  });
+
+  it('should verify a required custom launcher pin before accepting complete qualification', async () => {
+    const artifact = createArtifact();
+    artifact.build.baseImages[0].digest = pinnedDigest;
+    artifact.capabilities[0].runtimeStatus = 'qualified';
+    artifact.launch.customLauncher = {
+      gitObject : '8888888888888888888888888888888888888888',
+      path      : 'packages/dwn-server/src/lab-launcher.ts',
+    };
+    artifact.qualification.status = 'qualified';
+    const dockerfileContents = dockerfile(`example.invalid/bun:mutable@${pinnedDigest}`);
+    artifact.qualification.evidence = [{ proof: 'run the server', reference: '' }];
+    const missingEvidence = await runCatalogPreflight({
+      artifacts : [artifact],
+      git       : createGitReader(artifact, lockContents, dockerfileContents),
+      mode      : 'fixture',
+    });
+    expect(missingEvidence.checks.find((check): boolean => check.id === 'test-server.runtime-qualification')?.status).toBe('fail');
+
+    artifact.qualification.evidence = [{ proof: 'run the server', reference: 'runtime report' }];
+    const passing = await runCatalogPreflight({
+      artifacts : [artifact],
+      git       : createGitReader(artifact, lockContents, dockerfileContents),
+      mode      : 'fixture',
+    });
+
+    expect(passing.status).toBe('pass');
+
+    const missingLauncher = createGitReader(artifact, lockContents, dockerfileContents);
+    const resolveObject = missingLauncher.resolveObject.bind(missingLauncher);
+    missingLauncher.resolveObject = async (specification): Promise<string | undefined> => specification.endsWith(':packages/dwn-server/src/lab-launcher.ts')
+      ? undefined
+      : resolveObject(specification);
+    const failing = await runCatalogPreflight({ artifacts: [artifact], git: missingLauncher, mode: 'fixture' });
+
+    expect(failing.status).toBe('fail');
+    expect(failing.checks.find((check): boolean => check.id === 'test-server.source-files')?.status).toBe('fail');
+  });
+
+  it('should reject a digest claim that the pinned Dockerfile does not use', async () => {
+    const artifact = createArtifact();
+    artifact.build.baseImages[0].digest = pinnedDigest;
+    const report = await runCatalogPreflight({
+      artifacts : [artifact],
+      git       : createGitReader(artifact),
+      mode      : 'fixture',
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks.find((check): boolean => check.id === 'test-server.immutable-base-images')?.status).toBe('fail');
   });
 
   it('should keep the two candidate source closures distinct and unqualified', () => {

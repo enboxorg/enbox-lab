@@ -28,6 +28,7 @@ describe('PkarrPublicationJournal', () => {
         packet,
         sequence,
       });
+      expect(reopened.count()).toBe(1);
     } finally {
       reopened.close();
       await rm(directory, { force: true, recursive: true });

@@ -33,7 +33,7 @@ describe('P0 real Pkarr persistence proof', () => {
       }
       if (joined.startsWith('docker image inspect')) {
         return result(JSON.stringify({
-          Architecture : 'amd64',
+          Architecture : process.arch === 'arm64' ? 'arm64' : 'amd64',
           Id           : 'sha256:image-config',
           Os           : 'linux',
           RepoDigests  : [PKARR_RELAY_IMAGE],
@@ -50,6 +50,12 @@ describe('P0 real Pkarr persistence proof', () => {
       if (joined.startsWith('docker port')) {
         return result(`127.0.0.1:${41_000 + relayStarts}`);
       }
+      if (joined.startsWith('docker ps --all --quiet')) {
+        return result(resourcePresent ? `relay-container-${relayStarts}` : '');
+      }
+      if (joined.startsWith('docker network ls --quiet')) {
+        return result('network-id');
+      }
       if (joined.includes('--format {{json .Config}}')) {
         return result(JSON.stringify({
           Cmd    : ['pkarr-relay', '--testnet'],
@@ -62,8 +68,7 @@ describe('P0 real Pkarr persistence proof', () => {
       }
       if (joined.startsWith('docker network inspect') && joined.includes('--format {{json .}}')) {
         return result(JSON.stringify({
-          Internal : false,
-          Labels   : {
+          Labels: {
             'org.enbox.lab.ownership-id' : '33333333-3333-4333-8333-333333333333',
             'org.enbox.lab.proof-run-id' : '11111111-1111-4111-8111-111111111111',
           },
@@ -168,6 +173,70 @@ describe('P0 real Pkarr persistence proof', () => {
       id     : 'A04-docker-engine',
       status : 'unsupported',
     })]);
+  });
+
+  it('should discover and remove a labeled container left by a failed Docker run', async () => {
+    const commands: string[][] = [];
+    let partialContainerPresent = false;
+    let networkPresent = false;
+    const runner = async (command: string[]): Promise<CommandResult> => {
+      commands.push(command);
+      const joined = command.join(' ');
+      if (joined.startsWith('docker version')) {
+        return result('{"Server":{"Version":"proof"}}');
+      }
+      if (joined.startsWith('docker image inspect')) {
+        return result(JSON.stringify({
+          Architecture : process.arch === 'arm64' ? 'arm64' : 'amd64',
+          Id           : 'sha256:image-config',
+          Os           : 'linux',
+          RepoDigests  : [PKARR_RELAY_IMAGE],
+        }));
+      }
+      if (joined.startsWith('docker network create')) {
+        networkPresent = true;
+        return result('network-id');
+      }
+      if (joined.startsWith('docker run')) {
+        partialContainerPresent = true;
+        return result('', 1, 'container start failed after creation');
+      }
+      if (joined.startsWith('docker ps --all --quiet')) {
+        return result(partialContainerPresent ? 'partial-container-id' : '');
+      }
+      if (joined.startsWith('docker network ls --quiet')) {
+        return result(networkPresent ? 'network-id' : '');
+      }
+      if (joined.startsWith('docker rm --force partial-container-id')) {
+        partialContainerPresent = false;
+        return result('partial-container-id');
+      }
+      if (joined.startsWith('docker network rm')) {
+        networkPresent = false;
+        return result('removed');
+      }
+      if (joined.startsWith('docker inspect')) {
+        return partialContainerPresent ? result('{}') : result('', 1, 'Error: No such object: proof');
+      }
+      if (joined.startsWith('docker network inspect')) {
+        return networkPresent ? result('{}') : result('', 1, 'Error: No such network: proof');
+      }
+      return result('', 1, `unexpected command: ${joined}`);
+    };
+
+    const report = await runDidRuntimeProof({
+      now        : (): Date => new Date('2026-09-20T12:00:00.000Z'),
+      randomUuid : (): string => crypto.randomUUID(),
+      runCommand : runner,
+    });
+
+    expect(report.status).toBe('fail');
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      id     : 'proof-resource-cleanup',
+      status : 'pass',
+    }));
+    expect(partialContainerPresent).toBe(false);
+    expect(commands).toContainEqual(['docker', 'rm', '--force', 'partial-container-id']);
   });
 
   it('should parse only a valid loopback port mapping', () => {

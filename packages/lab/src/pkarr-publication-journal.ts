@@ -10,6 +10,7 @@ export type AcceptedPkarrPublication = {
 };
 
 export interface PkarrPublicationStore {
+  count(): number;
   get(identifier: string): AcceptedPkarrPublication | undefined;
   list(): AcceptedPkarrPublication[];
   set(publication: AcceptedPkarrPublication): void;
@@ -44,6 +45,10 @@ export class PkarrPublicationJournal implements PkarrPublicationStore {
     this._database.close();
   }
 
+  public count(): number {
+    return this._database.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM accepted_publications').get()?.count ?? 0;
+  }
+
   public get(identifier: string): AcceptedPkarrPublication | undefined {
     const row = this._database
       .query<PublicationRow, [string]>(`
@@ -68,23 +73,23 @@ export class PkarrPublicationJournal implements PkarrPublicationStore {
   }
 
   public set(publication: AcceptedPkarrPublication): void {
-    const current = this.get(publication.identifier);
-    if (current !== undefined && publication.sequence < current.sequence) {
-      throw new Error(`Pkarr publication '${publication.identifier}' would regress its durable sequence.`);
-    }
-    if (current !== undefined && publication.sequence === current.sequence &&
-      (current.packet.byteLength !== publication.packet.byteLength ||
-       current.packet.some((value, index): boolean => value !== publication.packet[index]))) {
-      throw new Error(`Pkarr publication '${publication.identifier}' conflicts at the durable sequence.`);
-    }
-
     const values: SQLQueryBindings[] = [
       publication.identifier,
       publication.sequence.toString(),
       publication.packet,
       publication.acceptedAt,
     ];
-    this._database.transaction((): void => {
+    const write = this._database.transaction((): void => {
+      const current = this.get(publication.identifier);
+      if (current !== undefined && publication.sequence < current.sequence) {
+        throw new Error(`Pkarr publication '${publication.identifier}' would regress its durable sequence.`);
+      }
+      if (current !== undefined && publication.sequence === current.sequence &&
+        (current.packet.byteLength !== publication.packet.byteLength ||
+         current.packet.some((value, index): boolean => value !== publication.packet[index]))) {
+        throw new Error(`Pkarr publication '${publication.identifier}' conflicts at the durable sequence.`);
+      }
+
       this._database.run(`
         INSERT INTO accepted_publications (identifier, sequence, packet, accepted_at)
         VALUES (?, ?, ?, ?)
@@ -93,7 +98,8 @@ export class PkarrPublicationJournal implements PkarrPublicationStore {
           packet = excluded.packet,
           accepted_at = excluded.accepted_at
       `, values);
-    })();
+    });
+    write.immediate();
   }
 
   private static fromRow(row: PublicationRow): AcceptedPkarrPublication {

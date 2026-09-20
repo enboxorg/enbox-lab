@@ -2,6 +2,7 @@
 
 import type { LabCheck, LabProofReport } from './proof-result.js';
 
+import { exitCodeForProofStatus } from './proof-result.js';
 import { runCatalogPreflightCli } from './catalog/preflight.js';
 import { runDidRuntimeProof } from './proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from './doctor.js';
@@ -60,7 +61,7 @@ async function run(): Promise<number> {
     } else {
       printTextReport(report);
     }
-    return report.status === 'pass' ? 0 : 1;
+    return exitCodeForProofStatus(report.status);
   }
 
   if (command === 'prepare') {
@@ -79,7 +80,7 @@ async function run(): Promise<number> {
     } else {
       printTextReport(report);
     }
-    return report.status === 'pass' ? 0 : 1;
+    return exitCodeForProofStatus(report.status);
   }
 
   const doctorArgs = args.slice(1);
@@ -96,7 +97,7 @@ async function run(): Promise<number> {
   } else {
     printTextReport(report);
   }
-  return report.status === 'pass' ? 0 : 1;
+  return exitCodeForProofStatus(report.status);
 }
 
 process.exitCode = await run();

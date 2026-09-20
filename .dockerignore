@@ -1,4 +1,5 @@
 .git
+.ci
 node_modules
 dist
 coverage

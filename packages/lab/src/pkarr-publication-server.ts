@@ -13,6 +13,7 @@ export type PkarrPublicationServerOptions = {
   hostname?: string;
   journalLocation: string;
   maintenanceIntervalMs?: number;
+  maxPublications?: number;
   port?: number;
   requestTimeoutMs?: number;
   shutdownTimeoutMs?: number;
@@ -40,10 +41,14 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
   if (!Number.isSafeInteger(maintenanceIntervalMs) || maintenanceIntervalMs <= 0) {
     throw new RangeError('Pkarr maintenance interval must be a positive safe integer.');
   }
+  if (options.maxPublications !== undefined && (!Number.isSafeInteger(options.maxPublications) || options.maxPublications < 1)) {
+    throw new RangeError('Pkarr maximum publication count must be a positive safe integer.');
+  }
   const journal = new PkarrPublicationJournal(options.journalLocation);
   const adapter = new PkarrPublicationAdapter({
-    fetch: options.fetch,
+    fetch           : options.fetch,
     journal,
+    maxPublications : options.maxPublications,
     requestTimeoutMs,
     upstreamBaseUrl,
   });
@@ -69,12 +74,12 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
       fetch: async (request): Promise<Response> => {
         const url = new URL(request.url);
         if (url.pathname === '/__lab/health') {
-          const maintenanceError = adapter.lastError;
+          const error = adapter.lastError;
           return Response.json({
-            acceptedPublications : journal.list().length,
-            maintenanceError     : maintenanceError ?? null,
-            status               : maintenanceError === undefined ? 'ready' : 'degraded',
-          }, { status: maintenanceError === undefined ? 200 : 503 });
+            acceptedPublications : journal.count(),
+            error                : error ?? null,
+            status               : error === undefined ? 'ready' : 'degraded',
+          }, { status: error === undefined ? 200 : 503 });
         }
         return adapter.handle(request);
       },
@@ -88,28 +93,31 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
     throw error;
   }
 
-  let stopped = false;
+  let stopPromise: Promise<void> | undefined;
+  const stop = async (): Promise<void> => {
+    adapter.beginShutdown();
+    const gracefulStop = Promise.all([Promise.resolve(server.stop(false)), adapter.drain()]);
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const shutdownTimeout = new Promise<false>((resolve): void => {
+      timeoutId = setTimeout((): void => { resolve(false); }, shutdownTimeoutMs);
+    });
+    const stoppedGracefully = await Promise.race([gracefulStop.then((): true => true), shutdownTimeout]);
+    clearTimeout(timeoutId);
+    if (!stoppedGracefully) {
+      void server.stop(true);
+      void gracefulStop.then((): void => { journal.close(); }).catch((): void => {});
+      throw new Error(`Pkarr publication server did not drain within ${shutdownTimeoutMs} milliseconds.`);
+    }
+    journal.close();
+  };
   return {
     endpoint : `http://${hostname}:${server.port}/`,
     restoreResults,
-    stop     : async (): Promise<void> => {
-      if (stopped) {
-        return;
+    stop     : (): Promise<void> => {
+      if (stopPromise === undefined) {
+        stopPromise = stop();
       }
-      stopped = true;
-      adapter.beginShutdown();
-      const gracefulStop = Promise.all([Promise.resolve(server.stop(false)), adapter.drain()]);
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      const shutdownTimeout = new Promise<false>((resolve): void => {
-        timeoutId = setTimeout((): void => { resolve(false); }, shutdownTimeoutMs);
-      });
-      const stoppedGracefully = await Promise.race([gracefulStop.then((): true => true), shutdownTimeout]);
-      clearTimeout(timeoutId);
-      if (!stoppedGracefully) {
-        await server.stop(true);
-        await adapter.drain();
-      }
-      journal.close();
+      return stopPromise;
     },
   };
 }

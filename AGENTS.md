@@ -8,9 +8,13 @@ Use a task branch and pull request for every change. Before pushing, run:
 
 ```sh
 bun run lint
+bun run typecheck
 bun run build
-bun run test:node
+bun run test:coverage
 ```
+
+Changes to catalog, routing, DID persistence, Docker ownership, or proof verdicts
+also require `bun run verify:linux --repository <enbox-clone> --evidence <dir>`.
 
 Proofs distinguish `pass`, `fail`, and `unsupported`. Missing platform,
 runtime, path, or cache evidence never counts as a pass. Docker cleanup targets

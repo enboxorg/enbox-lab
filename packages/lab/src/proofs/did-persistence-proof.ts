@@ -26,6 +26,17 @@ function documentsEqual(left: DidDocument | undefined, right: DidDocument): bool
   return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
 
+function hasAdvertisedDwnEndpoint(document: DidDocument | undefined, endpoint: string): boolean {
+  return document?.service?.some((service): boolean => {
+    if (service.type !== 'DecentralizedWebNode') {
+      return false;
+    }
+    return Array.isArray(service.serviceEndpoint)
+      ? service.serviceEndpoint.includes(endpoint)
+      : service.serviceEndpoint === endpoint;
+  }) === true;
+}
+
 async function readSignedPacket(adapterEndpoint: string, didUri: string, requestTimeoutMs: number): Promise<Uint8Array> {
   const identifier = didUri.split(':').at(-1);
   if (identifier === undefined || identifier.length === 0) {
@@ -87,6 +98,7 @@ export async function runDidPersistenceProof(options: DidPersistenceProofOptions
     });
     originalPacketHash = packetHash(await readSignedPacket(firstAdapter.endpoint, didUri, requestTimeoutMs));
     expectedDocument = resolvedDocument(beforeRestart);
+    const advertisedEndpointPresent = hasAdvertisedDwnEndpoint(expectedDocument, options.advertisedDwnEndpoint);
 
     checks.push({
       details: {
@@ -100,12 +112,16 @@ export async function runDidPersistenceProof(options: DidPersistenceProofOptions
         : 'The DID publication was not acknowledged',
     });
     checks.push({
-      details : { resolutionError: String(beforeRestart.didResolutionMetadata.error ?? '') },
+      details: {
+        advertisedDwnEndpoint : options.advertisedDwnEndpoint,
+        advertisedEndpointPresent,
+        resolutionError       : String(beforeRestart.didResolutionMetadata.error ?? ''),
+      },
       id      : 'A06-private-resolution-before-restart',
-      status  : expectedDocument?.id === didUri ? 'pass' : 'fail',
-      summary : expectedDocument?.id === didUri
-        ? 'The published DID resolved through the private upstream before recreation'
-        : 'The published DID did not resolve to its expected document before recreation',
+      status  : expectedDocument?.id === didUri && advertisedEndpointPresent ? 'pass' : 'fail',
+      summary : expectedDocument?.id === didUri && advertisedEndpointPresent
+        ? 'The published DID resolved with its advertised DWN endpoint through the private upstream before recreation'
+        : 'The published DID did not resolve with its advertised DWN endpoint before recreation',
     });
   } finally {
     await firstAdapter.stop();
@@ -127,6 +143,8 @@ export async function runDidPersistenceProof(options: DidPersistenceProofOptions
     const restored = secondAdapter.restoreResults.length === 1 &&
       secondAdapter.restoreResults[0].status === 'restored' &&
       originalPacketHash.length > 0 && originalPacketHash === restoredPacketHash;
+    const restoredDocument = resolvedDocument(afterRestart);
+    const advertisedEndpointPresent = hasAdvertisedDwnEndpoint(restoredDocument, options.advertisedDwnEndpoint);
     checks.push({
       details: {
         originalPacketHash,
@@ -140,12 +158,18 @@ export async function runDidPersistenceProof(options: DidPersistenceProofOptions
         : 'The signed publication was not restored after upstream recreation',
     });
     checks.push({
-      details : { resolutionError: String(afterRestart.didResolutionMetadata.error ?? '') },
-      id      : 'A08-resolution-after-restoration',
-      status  : expectedDocument !== undefined && documentsEqual(resolvedDocument(afterRestart), expectedDocument) ? 'pass' : 'fail',
-      summary : expectedDocument !== undefined && documentsEqual(resolvedDocument(afterRestart), expectedDocument)
-        ? 'The DID resolved to the expected document after restoration'
-        : 'The restored DID did not resolve to the expected document',
+      details: {
+        advertisedDwnEndpoint : options.advertisedDwnEndpoint,
+        advertisedEndpointPresent,
+        resolutionError       : String(afterRestart.didResolutionMetadata.error ?? ''),
+      },
+      id     : 'A08-resolution-after-restoration',
+      status : expectedDocument !== undefined && documentsEqual(restoredDocument, expectedDocument) && advertisedEndpointPresent
+        ? 'pass'
+        : 'fail',
+      summary: expectedDocument !== undefined && documentsEqual(restoredDocument, expectedDocument) && advertisedEndpointPresent
+        ? 'The DID resolved to the expected document and advertised DWN endpoint after restoration'
+        : 'The restored DID did not resolve to the expected document and advertised DWN endpoint',
     });
     checks.push({
       id      : 'A09-network-only-cache-bypass',
@@ -163,3 +187,7 @@ export async function runDidPersistenceProof(options: DidPersistenceProofOptions
     startedAt,
   });
 }
+
+export const didPersistenceProofInternals = {
+  hasAdvertisedDwnEndpoint,
+};

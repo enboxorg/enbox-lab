@@ -1,9 +1,10 @@
+import type { DidDocument } from '@enbox/dids';
 import type { Server } from 'bun';
 
 import { join } from 'node:path';
-import { runDidPersistenceProof } from '../src/proofs/did-persistence-proof.js';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'bun:test';
+import { didPersistenceProofInternals, runDidPersistenceProof } from '../src/proofs/did-persistence-proof.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 
 type Relay = {
@@ -32,6 +33,25 @@ async function startRelay(): Promise<Relay> {
 }
 
 describe('DID persistence proof', () => {
+  it('should require an exact DecentralizedWebNode service endpoint', () => {
+    const document = {
+      id      : 'did:dht:example',
+      service : [{
+        id              : 'did:dht:example#dwn',
+        serviceEndpoint : ['http://localhost:43210', 'http://localhost:43211'],
+        type            : 'DecentralizedWebNode',
+      }],
+    } satisfies DidDocument;
+
+    expect(didPersistenceProofInternals.hasAdvertisedDwnEndpoint(document, 'http://localhost:43210')).toBe(true);
+    expect(didPersistenceProofInternals.hasAdvertisedDwnEndpoint(document, 'http://localhost:43212')).toBe(false);
+    expect(didPersistenceProofInternals.hasAdvertisedDwnEndpoint({
+      ...document,
+      service: [{ ...document.service[0], type: 'LinkedDomains' }],
+    }, 'http://localhost:43210')).toBe(false);
+    expect(didPersistenceProofInternals.hasAdvertisedDwnEndpoint(undefined, 'http://localhost:43210')).toBe(false);
+  });
+
   it('should restore an exact signed DID publication after upstream recreation', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-did-proof-'));
     let relay = await startRelay();
@@ -49,6 +69,16 @@ describe('DID persistence proof', () => {
 
       expect(report.status).toBe('unsupported');
       expect(report.checks.filter((check): boolean => check.status === 'pass')).toHaveLength(4);
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        details : expect.objectContaining({ advertisedEndpointPresent: true }),
+        id      : 'A06-private-resolution-before-restart',
+        status  : 'pass',
+      }));
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        details : expect.objectContaining({ advertisedEndpointPresent: true }),
+        id      : 'A08-resolution-after-restoration',
+        status  : 'pass',
+      }));
       expect(report.checks).toContainEqual(expect.objectContaining({
         id     : 'A09-network-only-cache-bypass',
         status : 'unsupported',

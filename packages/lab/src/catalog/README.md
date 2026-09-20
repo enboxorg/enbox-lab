@@ -18,8 +18,11 @@ The preparation path is derived from the artifact ID and a SHA-256 build key cov
 the source commit and tree, dependency lock, Dockerfile pin, Bun toolchain, install
 command, and base-image inventory. Source is exported with `git archive`; the harness
 never calls `git checkout` or `git worktree` and rejects direct, symlinked, and dangling
-symlink output paths that lead into either repository. It retains one sealed source tar
-per build key and removes the temporary extracted tree after each run.
+symlink output paths that lead into either repository, including symlinks at the derived
+artifact and build-key directories. Every preparation starts from a fresh Git export,
+replaces the retained source tar, and removes the temporary extracted tree afterward. A
+previously retained tar is evidence output only and is never trusted or extracted as the
+next build input.
 
 Before Docker is called, the harness verifies:
 
@@ -52,3 +55,9 @@ Exit codes are `0` for a prepared image, `1` for a failed integrity/build check,
 JSON output is the evidence record for this preparation step and includes the retained
 sealed source archive. Preparation may access registries while Docker builds; later offline
 runtime behavior is outside this harness.
+
+Fixture preflight reads the pinned Dockerfile rather than trusting digest metadata in
+the catalog. A failed artifact or capability remains a failure. A `qualified` artifact
+passes only when every catalog capability is qualified, required custom-launcher source
+is pinned, and a nonempty evidence reference names every required runtime proof exactly
+once.

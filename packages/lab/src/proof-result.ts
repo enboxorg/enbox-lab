@@ -20,6 +20,9 @@ export type LabProofReport = {
 
 /** Returns the strict aggregate status for a proof's checks. */
 export function aggregateCheckStatus(checks: LabCheck[]): LabProofStatus {
+  if (checks.length === 0) {
+    return 'fail';
+  }
   if (checks.some((check): boolean => check.status === 'fail')) {
     return 'fail';
   }
@@ -27,6 +30,14 @@ export function aggregateCheckStatus(checks: LabCheck[]): LabProofStatus {
     return 'unsupported';
   }
   return 'pass';
+}
+
+/** Maps proof outcomes to stable CLI exit codes. */
+export function exitCodeForProofStatus(status: LabProofStatus): number {
+  if (status === 'pass') {
+    return 0;
+  }
+  return status === 'fail' ? 1 : 2;
 }
 
 /** Creates a completed proof report with a deterministic aggregate verdict. */

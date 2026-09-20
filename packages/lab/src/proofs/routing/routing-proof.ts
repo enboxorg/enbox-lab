@@ -3,12 +3,13 @@ import type { Browser, Page } from 'playwright';
 import type { LabCheck, LabCheckStatus, LabProofReport } from '../../proof-result.js';
 
 import { createConnection } from 'node:net';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 
 import { chromium } from 'playwright';
 
 import { createProofReport } from '../../proof-result.js';
+import { dockerResourceIsAbsent, imageMatchesHostArchitecture, isDigestPinnedImage } from '../docker-proof.js';
 
 type CommandResult = {
   exitCode: number;
@@ -119,23 +120,28 @@ const PROOF_LABEL = 'org.enbox.lab.proof-run-id';
 const PROOF_DISPLAY_NAME = 'Routing Proof Lab';
 const PROOF_IMAGE_BASE = 'enbox-lab-routing-proof';
 const TIMEOUT_MS = 5_000;
+export const ROUTING_BUN_IMAGE = 'oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4';
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 async function defaultRunCommand(command: string[], cwd?: string): Promise<CommandResult> {
-  const child = Bun.spawn(command, {
-    cwd,
-    stderr : 'pipe',
-    stdout : 'pipe',
-  });
-  const [exitCode, stderr, stdout] = await Promise.all([
-    child.exited,
-    new Response(child.stderr).text(),
-    new Response(child.stdout).text(),
-  ]);
-  return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  try {
+    const child = Bun.spawn(command, {
+      cwd,
+      stderr : 'pipe',
+      stdout : 'pipe',
+    });
+    const [exitCode, stderr, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ]);
+    return { exitCode, stderr: stderr.trim(), stdout: stdout.trim() };
+  } catch (error: unknown) {
+    return { exitCode: -1, stderr: errorMessage(error), stdout: '' };
+  }
 }
 
 async function expectCommand(
@@ -588,11 +594,31 @@ function workspaceRootFrom(start: string): string {
   }
 }
 
+type DockerResourceType = 'container' | 'image' | 'network' | 'volume';
+
+async function assertResourceNameAvailable(
+  runner: NonNullable<RoutingProofDependencies['runCommand']>,
+  type: DockerResourceType,
+  name: string,
+): Promise<void> {
+  const command = type === 'container'
+    ? ['docker', 'inspect', name]
+    : ['docker', type, 'inspect', name];
+  const result = await runner(command);
+  if (result.exitCode === 0) {
+    throw new Error(`Refusing to reuse existing Docker ${type} '${name}'.`);
+  }
+  if (!dockerResourceIsAbsent(result)) {
+    throw new Error(`Unable to verify Docker ${type} '${name}' is absent: ${result.stderr || result.stdout || 'no output'}`);
+  }
+}
+
 async function createLabFixture(params: {
   appPort: number;
   image: string;
   index: string;
   ownerId: string;
+  resourceCreated: (type: Exclude<DockerResourceType, 'image'>, name: string) => void;
   port: number;
   runId: string;
   runner: NonNullable<RoutingProofDependencies['runCommand']>;
@@ -612,21 +638,28 @@ async function createLabFixture(params: {
   const actorContainerName = `${baseName}-actor`;
   const gatewayNetworkAlias = `${baseName}-gateway.internal`;
 
+  await assertResourceNameAvailable(params.runner, 'network', networkName);
   await expectCommand(params.runner, [
     'docker', 'network', 'create', '--internal',
     ...labelArguments(params.runId, partial, 'network'),
     networkName,
   ]);
+  params.resourceCreated('network', networkName);
+  await assertResourceNameAvailable(params.runner, 'network', ingressNetworkName);
   await expectCommand(params.runner, [
     'docker', 'network', 'create',
     ...labelArguments(params.runId, partial, 'ingress-network'),
     ingressNetworkName,
   ]);
+  params.resourceCreated('network', ingressNetworkName);
+  await assertResourceNameAvailable(params.runner, 'volume', volumeName);
   await expectCommand(params.runner, [
     'docker', 'volume', 'create',
     ...labelArguments(params.runId, partial, 'gateway-data'),
     volumeName,
   ]);
+  params.resourceCreated('volume', volumeName);
+  await assertResourceNameAvailable(params.runner, 'container', gatewayContainerName);
   const gateway = await expectCommand(params.runner, [
     'docker', 'run', '--detach',
     '--name', gatewayContainerName,
@@ -650,6 +683,7 @@ async function createLabFixture(params: {
     '--lab-id', labId,
     '--port', String(params.port),
   ]);
+  params.resourceCreated('container', gatewayContainerName);
   await expectCommand(params.runner, [
     'docker', 'network', 'connect',
     '--alias', gatewayNetworkAlias,
@@ -698,7 +732,9 @@ async function runActorProbe(
   runId: string,
   image: string,
   fixture: LabFixture,
+  resourceCreated: (type: 'container', name: string) => void,
 ): Promise<ActorObservation> {
+  await assertResourceNameAvailable(runner, 'container', fixture.actorContainerName);
   const command = await expectCommand(runner, [
     'docker', 'run',
     '--name', fixture.actorContainerName,
@@ -712,6 +748,7 @@ async function runActorProbe(
     '--lab-id', fixture.labId,
     '--port', String(fixture.port),
   ]);
+  resourceCreated('container', fixture.actorContainerName);
   return lastJsonLine<ActorObservation>(command.stdout);
 }
 
@@ -720,10 +757,12 @@ async function runReachabilityProbe(params: {
   containerName: string;
   fixture: LabFixture;
   image: string;
+  resourceCreated: (type: 'container', name: string) => void;
   runId: string;
   runner: NonNullable<RoutingProofDependencies['runCommand']>;
   url: string;
 }): Promise<ReachabilityObservation> {
+  await assertResourceNameAvailable(params.runner, 'container', params.containerName);
   const command = await expectCommand(params.runner, [
     'docker', 'run',
     '--name', params.containerName,
@@ -732,19 +771,50 @@ async function runReachabilityProbe(params: {
     params.image,
     'reachability', '--url', params.url,
   ]);
+  params.resourceCreated('container', params.containerName);
   return lastJsonLine<ReachabilityObservation>(command.stdout);
 }
 
 async function filteredResourceNames(
   runner: NonNullable<RoutingProofDependencies['runCommand']>,
-  type: 'container' | 'network' | 'volume',
+  type: DockerResourceType,
   label: string,
 ): Promise<string[]> {
   const command = type === 'container'
     ? ['docker', 'ps', '--all', '--quiet', '--filter', `label=${label}`]
-    : ['docker', type, 'ls', '--quiet', '--filter', `label=${label}`];
+    : type === 'image'
+      ? ['docker', 'image', 'ls', '--quiet', '--filter', `label=${label}`]
+      : ['docker', type, 'ls', '--quiet', '--filter', `label=${label}`];
   const result = await expectCommand(runner, command);
   return result.stdout.split('\n').map((entry): string => entry.trim()).filter(Boolean);
+}
+
+async function discoverProofResources(
+  runner: NonNullable<RoutingProofDependencies['runCommand']>,
+  proofLabel: string,
+): Promise<{ containers: string[]; errors: string[]; images: string[]; networks: string[]; volumes: string[] }> {
+  const types = ['container', 'image', 'network', 'volume'] as const;
+  const results = await Promise.allSettled(types.map(
+    (type): Promise<string[]> => filteredResourceNames(runner, type, proofLabel),
+  ));
+  const resources = {
+    containers : [] as string[],
+    errors     : [] as string[],
+    images     : [] as string[],
+    networks   : [] as string[],
+    volumes    : [] as string[],
+  };
+
+  for (let index = 0; index < types.length; index += 1) {
+    const result = results[index];
+    const type = types[index];
+    if (result.status === 'fulfilled') {
+      resources[type === 'container' ? 'containers' : type === 'image' ? 'images' : type === 'network' ? 'networks' : 'volumes'] = result.value;
+    } else {
+      resources.errors.push(`unable to discover ${type} resources: ${errorMessage(result.reason)}`);
+    }
+  }
+  return resources;
 }
 
 async function removeOwnedResources(
@@ -775,14 +845,21 @@ async function existsInDocker(
   const command = type === 'container'
     ? ['docker', 'inspect', name]
     : ['docker', type, 'inspect', name];
-  return (await runner(command)).exitCode === 0;
+  const result = await runner(command);
+  if (result.exitCode === 0) {
+    return true;
+  }
+  if (dockerResourceIsAbsent(result)) {
+    return false;
+  }
+  throw new Error(`Unable to inspect Docker ${type} '${name}': ${result.stderr || result.stdout || 'no output'}`);
 }
 
 async function cleanupExact(
   runner: NonNullable<RoutingProofDependencies['runCommand']>,
   resources: {
     containers: string[];
-    image?: string;
+    images: string[];
     networks: string[];
     volumes: string[];
   },
@@ -792,11 +869,11 @@ async function cleanupExact(
     ...resources.containers.map((name): string[] => ['docker', 'rm', '--force', name]),
     ...resources.networks.map((name): string[] => ['docker', 'network', 'rm', name]),
     ...resources.volumes.map((name): string[] => ['docker', 'volume', 'rm', name]),
-    ...(resources.image === undefined ? [] : [['docker', 'image', 'rm', resources.image]]),
+    ...resources.images.map((name): string[] => ['docker', 'image', 'rm', name]),
   ];
   for (const command of commands) {
     const result = await runner(command);
-    if (result.exitCode !== 0 && !/No such|not found|does not exist/i.test(result.stderr)) {
+    if (result.exitCode !== 0 && !dockerResourceIsAbsent(result)) {
       errors.push(`${command.slice(0, 4).join(' ')}: ${result.stderr || result.stdout}`);
     }
   }
@@ -846,10 +923,13 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
   const sentinelVolume = `enbox-routing-${runToken}-unmanaged-data`;
   const checks: LabCheck[] = [];
   const cleanupResources = {
-    containers : [sentinelContainer],
-    image,
+    containers : [] as string[],
+    images     : [] as string[],
     networks   : [] as string[],
-    volumes    : [sentinelVolume],
+    volumes    : [] as string[],
+  };
+  const resourceCreated = (type: Exclude<DockerResourceType, 'image'>, name: string): void => {
+    cleanupResources[type === 'container' ? 'containers' : type === 'network' ? 'networks' : 'volumes'].push(name);
   };
   let sentinel: PortSentinel | undefined;
   let fixtureA: LabFixture | undefined;
@@ -872,30 +952,42 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
 
   try {
     sentinel = await startConventionalPortSentinel();
-    const baseImage = process.env.ENBOX_LAB_PROOF_BUN_IMAGE
-      ?? 'oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4';
+    const baseImage = ROUTING_BUN_IMAGE;
+    if (!isDigestPinnedImage(baseImage)) {
+      throw new Error('Routing proof Bun image must be selected by sha256 digest.');
+    }
     const dockerfile = resolve(workspaceRoot, 'packages/lab/src/proofs/routing/Dockerfile');
+    const dockerContext = dirname(dockerfile);
+    await assertResourceNameAvailable(runner, 'image', image);
     await expectCommand(runner, [
       'docker', 'build',
       '--build-arg', `BUN_IMAGE=${baseImage}`,
       '--file', dockerfile,
       '--label', `${PROOF_LABEL}=${runId}`,
       '--tag', image,
-      workspaceRoot,
-    ], workspaceRoot);
+      dockerContext,
+    ], dockerContext);
     const imageInspection = lastJsonLine<{
       Architecture?: string;
+      Config?: { Labels?: Record<string, string> };
       Id?: string;
       Os?: string;
       RepoDigests?: string[];
     }>((await expectCommand(runner, ['docker', 'image', 'inspect', image, '--format', '{{json .}}'])).stdout);
+    if (imageInspection.Id === undefined || imageInspection.Config?.Labels?.[PROOF_LABEL] !== runId) {
+      throw new Error('Built routing image does not carry the current proof ownership label.');
+    }
+    cleanupResources.images.push(imageInspection.Id);
 
+    await assertResourceNameAvailable(runner, 'volume', sentinelVolume);
     await expectCommand(runner, [
       'docker', 'volume', 'create',
       '--label', `${DISPLAY_LABEL}=${PROOF_DISPLAY_NAME}`,
       '--label', `${PROOF_LABEL}=${runId}`,
       sentinelVolume,
     ]);
+    resourceCreated('volume', sentinelVolume);
+    await assertResourceNameAvailable(runner, 'container', sentinelContainer);
     await expectCommand(runner, [
       'docker', 'run', '--detach',
       '--name', sentinelContainer,
@@ -904,33 +996,25 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
       '--label', `${PROOF_LABEL}=${runId}`,
       image, 'hold',
     ]);
+    resourceCreated('container', sentinelContainer);
 
     const [portA, appPortA, walletPortA, portB, appPortB, walletPortB] = await allocateDistinctPorts(6, allocatePort);
     fixtureA = await createLabFixture({
-      appPort: appPortA, image, index: 'a', ownerId: ownerA, port: portA, runId, runner, walletPort: walletPortA,
+      appPort: appPortA, image, index: 'a', ownerId: ownerA, port: portA, resourceCreated, runId, runner, walletPort: walletPortA,
     });
     fixtureB = await createLabFixture({
-      appPort: appPortB, image, index: 'b', ownerId: ownerB, port: portB, runId, runner, walletPort: walletPortB,
+      appPort: appPortB, image, index: 'b', ownerId: ownerB, port: portB, resourceCreated, runId, runner, walletPort: walletPortB,
     });
-    cleanupResources.containers.push(
-      fixtureA.gatewayContainerName, fixtureA.actorContainerName,
-      fixtureB.gatewayContainerName, fixtureB.actorContainerName,
-    );
-    cleanupResources.networks.push(
-      fixtureA.networkName, fixtureA.ingressNetworkName,
-      fixtureB.networkName, fixtureB.ingressNetworkName,
-    );
-    cleanupResources.volumes.push(fixtureA.volumeName, fixtureB.volumeName);
     await Promise.all([waitForGateway(fixtureA), waitForGateway(fixtureB)]);
 
     const canonicalUrl = `http://${fixtureA.actorAlias}:${fixtureA.port}`;
     const [hostObservation, actorObservation, browserObservation, foreignOriginRejected] = await Promise.all([
       hostEndpointProbe(canonicalUrl, fixtureA.labId),
-      runActorProbe(runner, runId, image, fixtureA),
+      runActorProbe(runner, runId, image, fixtureA, resourceCreated),
       browserNetworkProbe(fixtureA, dependencies.browserExecutablePath),
       rejectsForeignOrigin(canonicalUrl),
     ]);
-    const actorBObservation = await runActorProbe(runner, runId, image, fixtureB);
+    const actorBObservation = await runActorProbe(runner, runId, image, fixtureB, resourceCreated);
 
     checks.push({
       details : endpointDetails(hostObservation),
@@ -969,13 +1053,13 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
 
     const crossContainer = `enbox-routing-${runToken}-cross-a`;
     const externalContainer = `enbox-routing-${runToken}-external-a`;
-    cleanupResources.containers.push(crossContainer, externalContainer);
     const [crossLab, publicEgress] = await Promise.all([
       runReachabilityProbe({
         actorId       : 'cross-lab-probe',
         containerName : crossContainer,
         fixture       : fixtureA,
         image,
+        resourceCreated,
         runId,
         runner,
         url           : `http://${fixtureB.gatewayNetworkAlias}:${fixtureB.port}/health`,
@@ -985,6 +1069,7 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
         containerName : externalContainer,
         fixture       : fixtureA,
         image,
+        resourceCreated,
         runId,
         runner,
         url           : 'https://example.com/',
@@ -1060,8 +1145,15 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
         : 'Deleting lab A affected another resource or left owned resources running',
     });
 
+    const supportedHost = ['linux', 'darwin'].includes(process.platform) && ['arm64', 'x64'].includes(process.arch);
+    const nativeImage = imageMatchesHostArchitecture(imageInspection);
+    const runtimeMatches = [actorObservation.runtime, actorBObservation.runtime].every((runtime): boolean => (
+      runtime.architecture === process.arch && runtime.bun === '1.3.14' && runtime.platform === 'linux'
+    ));
     checks.push({
       details: {
+        actorARuntime       : JSON.stringify(actorObservation.runtime),
+        actorBRuntime       : JSON.stringify(actorBObservation.runtime),
         baseImage,
         dockerVersion       : dockerVersion.stdout,
         imageArchitecture   : imageInspection.Architecture ?? '',
@@ -1072,16 +1164,22 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
         runtimePlatform     : process.platform,
       },
       id      : 'A04-current-platform',
-      status  : ['linux', 'darwin'].includes(process.platform) && ['arm64', 'x64'].includes(process.arch) ? 'pass' : 'unsupported',
-      summary : `Recorded Docker, Bun and image identity on ${process.platform}/${process.arch}`,
+      status  : supportedHost ? nativeImage && runtimeMatches ? 'pass' : 'fail' : 'unsupported',
+      summary : supportedHost && nativeImage && runtimeMatches
+        ? `Recorded the pinned Bun runtime on a native Docker image for ${process.platform}/${process.arch}`
+        : supportedHost
+          ? `Docker selected a foreign image or unexpected Bun runtime on ${process.platform}/${process.arch}`
+          : `The current ${process.platform}/${process.arch} host is outside the supported platform matrix`,
     });
     checks.push({
       details : { currentPlatform: process.platform, requiredPlatform: 'darwin' },
       id      : 'A04-macos-evidence',
-      status  : process.platform === 'darwin' ? 'pass' : 'unsupported',
-      summary : process.platform === 'darwin'
-        ? 'The routing proof ran natively on macOS'
-        : 'Native macOS evidence must be collected on a macOS runner',
+      status  : process.platform === 'darwin' ? nativeImage ? 'pass' : 'fail' : 'unsupported',
+      summary : process.platform === 'darwin' && nativeImage
+        ? 'The routing proof ran with a native image architecture on macOS'
+        : process.platform === 'darwin'
+          ? 'Docker used a foreign image architecture on macOS'
+          : 'Native macOS evidence must be collected on a macOS runner',
     });
 
     const addressFamilies = new Set([
@@ -1122,18 +1220,16 @@ export async function runRoutingProof(dependencies: RoutingProofDependencies = {
   } finally {
     sentinel?.stop();
     const proofLabel = `${PROOF_LABEL}=${runId}`;
-    const [runContainers, runNetworks, runVolumes] = await Promise.all([
-      filteredResourceNames(runner, 'container', proofLabel).catch((): string[] => []),
-      filteredResourceNames(runner, 'network', proofLabel).catch((): string[] => []),
-      filteredResourceNames(runner, 'volume', proofLabel).catch((): string[] => []),
-    ]);
-    cleanupResources.containers.push(...runContainers);
-    cleanupResources.networks.push(...runNetworks);
-    cleanupResources.volumes.push(...runVolumes);
+    const discovered = await discoverProofResources(runner, proofLabel);
+    cleanupResources.containers.push(...discovered.containers);
+    cleanupResources.images.push(...discovered.images);
+    cleanupResources.networks.push(...discovered.networks);
+    cleanupResources.volumes.push(...discovered.volumes);
     cleanupResources.containers = [...new Set(cleanupResources.containers)];
+    cleanupResources.images = [...new Set(cleanupResources.images)];
     cleanupResources.networks = [...new Set(cleanupResources.networks)];
     cleanupResources.volumes = [...new Set(cleanupResources.volumes)];
-    const cleanupErrors = await cleanupExact(runner, cleanupResources);
+    const cleanupErrors = [...discovered.errors, ...await cleanupExact(runner, cleanupResources)];
     checks.push({
       details : { errors: JSON.stringify(cleanupErrors), resourcePrefix: `enbox-routing-${runToken}` },
       id      : 'proof-resource-cleanup',
