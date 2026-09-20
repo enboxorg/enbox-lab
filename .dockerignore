@@ -1,0 +1,11 @@
+.git
+.ci
+node_modules
+dist
+coverage
+coverage-*
+tests
+docs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
