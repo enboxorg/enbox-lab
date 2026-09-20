@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+coverage-*/
+.turbo/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
