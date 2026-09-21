@@ -9,6 +9,13 @@ import { PKARR_PACKET_MAX_BYTES, PkarrPublicationAdapter } from './pkarr-publica
 export const PKARR_MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000;
 
 export type PkarrPublicationServerOptions = {
+  /**
+   * Starts the released-process compatibility route for originless agents. The route isolates browsers but does not
+   * authenticate local processes and is not the final canonical gateway for every actor.
+   */
+  actorIngress?: boolean;
+  /** Pins the actor listener so its public authoritative URI can survive a lab restart. Zero selects an ephemeral port. */
+  actorPort?: number;
   allowedOrigins?: readonly string[];
   fetch?: PkarrFetch;
   hostname?: string;
@@ -31,27 +38,32 @@ function randomCapability(): string {
   return [...bytes].map((byte): string => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function resolverHeaders(response?: Response): Headers {
-  const headers = new Headers(response?.headers);
+function ingressHeaders(response?: Response): Headers {
+  const headers = new Headers();
+  if (response !== undefined) {
+    const contentType = response.headers.get('content-type');
+    if (contentType !== null) {
+      headers.set('Content-Type', contentType);
+    }
+  }
   headers.set('Cache-Control', 'no-store');
   headers.set('Content-Security-Policy', 'default-src \'none\'; frame-ancestors \'none\'');
   headers.set('Cross-Origin-Resource-Policy', 'same-origin');
   headers.set('Referrer-Policy', 'no-referrer');
   headers.set('X-Content-Type-Options', 'nosniff');
-  headers.delete('Access-Control-Allow-Origin');
   return headers;
 }
 
-function resolverResponse(response: Response): Response {
+function ingressResponse(response: Response): Response {
   return new Response(response.body, {
-    headers    : resolverHeaders(response),
+    headers    : ingressHeaders(response),
     status     : response.status,
     statusText : response.statusText,
   });
 }
 
-function resolverNotFound(): Response {
-  return new Response('not found', { headers: resolverHeaders(), status: 404 });
+function ingressNotFound(): Response {
+  return new Response('not found', { headers: ingressHeaders(), status: 404 });
 }
 
 function hasBrowserRequestMetadata(headers: Headers): boolean {
@@ -132,6 +144,13 @@ function isPkarrPath(pathname: string): boolean {
 }
 
 export type PkarrPublicationServer = {
+  /**
+   * Returns the public actor base URI. Released DidDht writes it into signed authoritative gateway records; callers
+   * must not treat it as a secret. Its policy isolates browsers but does not authenticate local processes.
+   */
+  actorEndpoint(): string | undefined;
+  /** Returns policy-pass counts. Admission does not imply upstream acceptance or durable retention. */
+  actorObservation(): { admittedGets: number; admittedPuts: number; rejected: number };
   browserRejectionCount(): number;
   endpoint: string;
   /** Returns the secret resolver base URI. Keep it out of logs, reports, URLs exposed to browsers, and argv. */
@@ -157,6 +176,13 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
   }
   if (!Number.isSafeInteger(maintenanceIntervalMs) || maintenanceIntervalMs <= 0) {
     throw new RangeError('Pkarr maintenance interval must be a positive safe integer.');
+  }
+  if (options.actorPort !== undefined && (!Number.isSafeInteger(options.actorPort) || options.actorPort < 0 ||
+    options.actorPort > 65_535)) {
+    throw new RangeError('Pkarr actor ingress port must be a safe integer between 0 and 65535.');
+  }
+  if (options.actorPort !== undefined && options.actorIngress !== true) {
+    throw new RangeError('Pkarr actor ingress port requires actor ingress to be enabled.');
   }
   if (options.maxPublications !== undefined && (!Number.isSafeInteger(options.maxPublications) || options.maxPublications < 1)) {
     throw new RangeError('Pkarr maximum publication count must be a positive safe integer.');
@@ -185,6 +211,12 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
 
   const hostname = options.hostname ?? '127.0.0.1';
   let browserRejections = 0;
+  let actorAdmittedGets = 0;
+  let actorAdmittedPuts = 0;
+  let actorRejected = 0;
+  let actorOrigin: string | undefined;
+  let actorServer: Server<undefined> | undefined;
+  let actorUri: string | undefined;
   let resolverAdmitted = 0;
   let resolverRejected = 0;
   let resolverOrigin: string | undefined;
@@ -193,20 +225,21 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
   let server: Server<undefined> | undefined;
   try {
     if (options.resolverIngress === true) {
-      const capability = randomCapability();
-      const prefix = `/__lab/resolver/${capability}/`;
+      const resolverCapability = randomCapability();
+      const prefix = `/__lab/resolver/${resolverCapability}/`;
       resolverServer = Bun.serve({
         fetch: async (request): Promise<Response> => {
           const url = new URL(request.url);
           const hasBrowserHeader = hasBrowserRequestMetadata(request.headers);
           const identifier = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : '';
-          if (url.origin !== resolverOrigin || request.method !== 'GET' || url.search !== '' || hasBrowserHeader ||
+          const expectedHref = resolverUri === undefined ? undefined : `${resolverUri}${identifier}`;
+          if (url.origin !== resolverOrigin || url.href !== expectedHref || request.method !== 'GET' || hasBrowserHeader ||
             !DID_DHT_IDENTIFIER_PATTERN.test(identifier)) {
             resolverRejected += 1;
-            return resolverNotFound();
+            return ingressNotFound();
           }
           resolverAdmitted += 1;
-          return resolverResponse(await adapter.handle(new Request(`http://resolver.invalid/${identifier}`, {
+          return ingressResponse(await adapter.handle(new Request(`http://resolver.invalid/${identifier}`, {
             method : 'GET',
             signal : request.signal,
           })));
@@ -217,6 +250,32 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
       });
       resolverOrigin = `http://127.0.0.1:${resolverServer.port}`;
       resolverUri = `${resolverOrigin}${prefix}`;
+    }
+    if (options.actorIngress === true) {
+      actorServer = Bun.serve({
+        fetch: async (request): Promise<Response> => {
+          const url = new URL(request.url);
+          const hasBrowserHeader = hasBrowserRequestMetadata(request.headers);
+          const identifier = url.pathname.startsWith('/') ? url.pathname.slice(1) : '';
+          const expectedHref = actorUri === undefined ? undefined : `${actorUri}${identifier}`;
+          if (url.origin !== actorOrigin || (request.method !== 'GET' && request.method !== 'PUT') ||
+            url.href !== expectedHref || hasBrowserHeader || !DID_DHT_IDENTIFIER_PATTERN.test(identifier)) {
+            actorRejected += 1;
+            return ingressNotFound();
+          }
+          if (request.method === 'GET') {
+            actorAdmittedGets += 1;
+          } else {
+            actorAdmittedPuts += 1;
+          }
+          return ingressResponse(await adapter.handle(new Request(`http://actor.invalid/${identifier}`, request)));
+        },
+        hostname           : '127.0.0.1',
+        maxRequestBodySize : PKARR_PACKET_MAX_BYTES,
+        port               : options.actorPort ?? 0,
+      });
+      actorOrigin = `http://127.0.0.1:${actorServer.port}`;
+      actorUri = `${actorOrigin}/`;
     }
     server = Bun.serve({
       fetch: async (request): Promise<Response> => {
@@ -252,8 +311,9 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
     });
     adapter.startMaintenance(maintenanceIntervalMs);
   } catch (error: unknown) {
-    await resolverServer?.stop(true);
-    await server?.stop(true);
+    await Promise.allSettled([actorServer, resolverServer, server].map(async (listener): Promise<void> => {
+      await listener?.stop(true);
+    }));
     adapter.stopMaintenance();
     journal.close();
     throw error;
@@ -268,6 +328,7 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
   const stop = async (): Promise<void> => {
     adapter.beginShutdown();
     const stopping = Promise.all([
+      Promise.resolve(actorServer?.stop(true)),
       Promise.resolve(resolverServer?.stop(true)),
       Promise.resolve(server.stop(true)),
       adapter.drain(),
@@ -279,6 +340,7 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
     const stopped = await Promise.race([stopping.then((): true => true), shutdownTimeout]);
     clearTimeout(timeoutId);
     if (!stopped) {
+      void actorServer?.stop(true);
       void resolverServer?.stop(true);
       void server.stop(true);
       void stopping.then((): void => { journal.close(); }).catch((): void => {});
@@ -287,6 +349,12 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
     journal.close();
   };
   return {
+    actorEndpoint    : (): string | undefined => actorUri,
+    actorObservation : (): { admittedGets: number; admittedPuts: number; rejected: number } => ({
+      admittedGets : actorAdmittedGets,
+      admittedPuts : actorAdmittedPuts,
+      rejected     : actorRejected,
+    }),
     browserRejectionCount : (): number => browserRejections,
     endpoint              : `http://${hostname}:${server.port}/`,
     resolverEndpoint      : (): string | undefined => resolverUri,
