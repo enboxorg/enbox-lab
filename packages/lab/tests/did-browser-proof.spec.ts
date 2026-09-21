@@ -103,6 +103,8 @@ function transportHarness(options: TransportHarnessOptions = {}): {
       return {
         browserRejectionCount : (): number => rejections,
         endpoint              : 'http://127.0.0.1:41003/',
+        resolverEndpoint      : (): undefined => undefined,
+        resolverObservation   : (): { admitted: number; rejected: number } => ({ admitted: 0, rejected: 0 }),
         restoreResults        : [],
         stop                  : async (): Promise<void> => { await cleanup('adapter'); },
       };
