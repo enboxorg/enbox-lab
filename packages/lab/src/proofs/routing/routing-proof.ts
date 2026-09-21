@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { chromium } from 'playwright';
 
 import { createProofReport } from '../../proof-result.js';
+import { findChromiumExecutable } from '../../runtime/chromium.js';
 import { dockerResourceIsAbsent, imageMatchesHostArchitecture, isDigestPinnedImage } from '../docker-proof.js';
 
 type CommandResult = {
@@ -386,20 +387,6 @@ async function rejectsForeignOrigin(baseUrl: string): Promise<boolean> {
   }
 }
 
-function findBrowserExecutable(explicitPath?: string): string | undefined {
-  const candidates = [
-    explicitPath,
-    process.env.ENBOX_LAB_CHROMIUM_PATH,
-    chromium.executablePath(),
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/snap/bin/chromium',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ];
-  return candidates.find((candidate): candidate is string => candidate !== undefined && existsSync(candidate));
-}
-
 async function pageWebSocketProbe(
   page: Page,
   baseUrl: string,
@@ -455,7 +442,7 @@ async function pageWebSocketProbe(
 }
 
 async function browserNetworkProbe(fixture: LabFixture, executablePath?: string): Promise<BrowserObservation> {
-  const selectedExecutable = findBrowserExecutable(executablePath);
+  const selectedExecutable = findChromiumExecutable(executablePath);
   if (selectedExecutable === undefined) {
     return {
       status : 'unsupported',

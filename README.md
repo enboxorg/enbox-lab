@@ -27,6 +27,7 @@ Run the live Docker proofs:
 
 ```sh
 bun packages/lab/src/cli.ts routing --json
+bun packages/lab/src/cli.ts did-browser --json
 bun packages/lab/src/cli.ts did-runtime --json
 ```
 
@@ -36,9 +37,9 @@ Run the complete Linux CI evidence contract against a full Enbox source clone:
 bun run verify:linux --repository ../enbox --evidence /tmp/enbox-lab-evidence
 ```
 
-This command runs the prerequisite, catalog, routing, and DID runtime reports. It
+This command runs the prerequisite, catalog, routing, browser DID, and DID runtime reports. It
 requires every established Linux subcheck to pass, accepts only the explicitly
-listed remaining unsupported gates, and writes the four reports plus a
+listed remaining unsupported gates, and writes the five reports plus a
 verification summary to the evidence directory.
 
 The Linux routing candidate assigns a distinct `http://localhost:<actor-port>` origin to each actor. The host gateway publishes those ports, while actor-local IPv4/IPv6 forwarders preserve the same URLs inside containers.
