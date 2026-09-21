@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
 
 import { runCatalogPreflight } from '../catalog/catalog-preflight.js';
+import { runConnectBrowserProof } from '../proofs/connect/connect-browser-proof.js';
 import { runDidRuntimeProof } from '../proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from '../doctor.js';
 import { runPrivateBrowserDidProof } from '../proofs/did-browser/did-browser-proof.js';
@@ -42,6 +43,28 @@ Runs the real Linux proof suite and verifies its exact pass/unsupported contract
 `;
 
 export const linuxProofContracts = {
+  browserConnect: {
+    pass: [
+      'A13-browser-popup-denial-subcheck',
+      'A13-popup-origin-source-binding-subcheck',
+      'A13-browser-relay-denial-subcheck',
+      'A03-connect-relay-route-containment-subcheck',
+      'A13-boundary-session-restart-subcheck',
+      'browser-connect-proof-cleanup',
+      'browser-connect-relay-runtime-cleanup',
+    ],
+    proof       : 'p0-browser-connect-denial-boundary',
+    unsupported : [
+      'A10-connect-private-did-network',
+      'A12-wallet-agent-process-and-secret-lifecycle',
+      'A13-wallet-agent-approval-and-response-sealing',
+      'A13-authenticated-worker-agent-channel',
+      'A13-relay-pin-approved-response',
+      'A14-delegated-session-lifecycle',
+      'A18-private-note-authorization',
+      'A24-connect-record-observation-equivalence',
+    ],
+  },
   browserDid: {
     pass: [
       'A06-browser-private-testnet',
@@ -211,6 +234,14 @@ async function runEvidence(params: {
     const report = await params.run();
     await writeJson(evidenceFile, report);
     const errors = validateProofReport(report, params.contract);
+    for (const check of report.checks) {
+      if (check.status === 'fail') {
+        errors.push(
+          `failed check '${check.id}': ${check.summary}` +
+          (check.details === undefined ? '' : `; details=${JSON.stringify(check.details)}`),
+        );
+      }
+    }
     return {
       errors,
       evidenceFile,
@@ -258,6 +289,12 @@ async function run(options: CliOptions): Promise<number> {
     evidenceDirectory : options.evidenceDirectory,
     filename          : 'browser-private-did.json',
     run               : runPrivateBrowserDidProof,
+  }));
+  entries.push(await runEvidence({
+    contract          : linuxProofContracts.browserConnect,
+    evidenceDirectory : options.evidenceDirectory,
+    filename          : 'browser-connect-denial.json',
+    run               : runConnectBrowserProof,
   }));
   entries.push(await runEvidence({
     contract          : linuxProofContracts.didRuntime,

@@ -4,6 +4,8 @@ export * from './pkarr-publication-adapter.js';
 export * from './pkarr-publication-journal.js';
 export * from './pkarr-publication-server.js';
 export * from './proof-result.js';
+export type { ConnectBrowserProofOptions } from './proofs/connect/connect-browser-proof.js';
+export { runConnectBrowserProof } from './proofs/connect/connect-browser-proof.js';
 export type {
   BoundConnectWorkerRequest,
   ConnectWorkerBoundaryErrorCode,

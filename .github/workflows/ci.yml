@@ -87,14 +87,28 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build proof harness
+        run: bun run build
+
       - name: Install managed Chromium and system dependencies
         run: bun run setup:browser:ci
 
       - name: Run and verify Linux boundary proofs
         run: >-
-          bun packages/lab/src/ci/verify-linux-proofs.ts
+          bun packages/lab/dist/esm/ci/verify-linux-proofs.js
           --repository "${{ github.workspace }}/.ci/enbox"
           --evidence "${{ runner.temp }}/enbox-lab-evidence"
+
+      - name: Verify built connect JSON CLI
+        shell: bash
+        run: |
+          set +e
+          bun packages/lab/dist/esm/cli.js connect-browser --json > "${{ runner.temp }}/enbox-lab-evidence/connect-browser-cli.json"
+          status=$?
+          set -e
+          test "$status" -eq 2
+          jq -s -e 'length == 1 and .[0].proof == "p0-browser-connect-denial-boundary" and .[0].status == "unsupported"' \
+            "${{ runner.temp }}/enbox-lab-evidence/connect-browser-cli.json"
 
       - name: Upload proof evidence
         if: always()

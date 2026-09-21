@@ -38,14 +38,31 @@ through `WalletPostMessageTransport`, relay direct/XC20P opening through
 cross-principal use, expiry, denial, cancellation, one-shot use, capacity, and
 worker restart invalidation.
 
-## Remaining P0 evidence
+Run the live browser denial boundary:
 
-These focused tests do not claim the full A13 browser/agent gate. The popup
-test uses Bun's `MessageEvent`/`MessagePort` implementation rather than managed
-Chromium, and the relay test stops after opening and binding the real request.
-The proof does not provide a configured wallet agent, owner identity, DWN,
-relay, service worker, encrypted note, outsider authorization check, or the
-successful `executeConnectApproval()` and response-sealing path. Until the
-integrated lab fixture supplies those and completes both handshakes, the real
-approval/application portion of A13 and the associated A10, A18, and A24 claims
-remain unsupported.
+```sh
+bun packages/lab/src/cli.ts connect-browser --json
+```
+
+This proof bundles the released browser/connect code into real Chromium. The
+dapp and wallet use separate canonical `http://localhost:<port>` origins. Popup requests pass through
+`PopupClientTransport`, `WalletPostMessageTransport`, and a dedicated worker
+whose fixture principal is fixed inside the worker rather than accepted from a
+command body. The relay path uses
+the real `RelayClientTransport` against exact `@enbox/dwn-server@0.1.43` with
+an owned file-backed SQLite database and forwarding, delivery, WebSockets, and rate limits off.
+It verifies denial, exact relay routes, single-use request and response state,
+fragment-key containment, worker restart invalidation, client cancellation,
+fresh-session liveness, and cleanup.
+
+## Remaining integrated evidence
+
+The denial proof still does not provide a configured wallet agent, owner
+identity, approved grants, service worker, encrypted note, outsider
+authorization check, or the successful `executeConnectApproval()` and
+response-sealing path. The PIN is intentionally never requested because a
+denial carries no approved response. Those application portions of A10,
+A12-A14, A18, and A24 remain explicit `unsupported` report checks until the
+integrated fixture supplies them. The fixed fixture principal proves registry
+binding behavior, not the future authenticated gateway channel to a wallet
+agent process; that channel remains an explicit unsupported check.
