@@ -19,12 +19,12 @@ bun packages/lab/src/cli.ts did-browser --json
 ```
 
 This listener is intentionally browser-only when origins are configured;
-originless server calls are rejected as well. The full stack still needs a
-separate authenticated or private-network ingress for server-side DID
-resolution. It also does not prove that the default agent, auth manager, API,
-and service-worker constructors all use the same per-instance network. That
-gate depends on the released Enbox package cohort containing
+originless server calls are rejected as well. The separate `did-server` proof
+uses the adapter's protected loopback resolver ingress for released-server
+authorization. This browser proof does not establish that the default agent,
+auth manager, API, and service-worker constructors all use the same per-instance
+network. That gate depends on the released Enbox package cohort containing
 [Enbox PR #1726](https://github.com/enboxorg/enbox/pull/1726). The report keeps
-those missing server and service-worker paths explicit as `unsupported`, and
-the standalone CLI returns the unsupported exit code even when every
-implemented subcheck passes.
+the remaining default-runtime and service-worker paths explicit as
+`unsupported`, and the standalone CLI returns the unsupported exit code even
+when every implemented subcheck passes.

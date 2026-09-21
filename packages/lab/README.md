@@ -11,4 +11,5 @@ bun packages/lab/src/cli.ts routing --json
 bun packages/lab/src/cli.ts connect-browser --json
 bun packages/lab/src/cli.ts did-browser --json
 bun packages/lab/src/cli.ts did-runtime --json
+bun packages/lab/src/cli.ts did-server --json
 ```

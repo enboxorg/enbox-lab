@@ -36,6 +36,8 @@
     "@enbox/connect": "0.1.23",
     "@enbox/crypto": "0.1.11",
     "@enbox/dids": "0.1.12",
+    "@enbox/dwn-clients": "0.4.35",
+    "@enbox/dwn-sdk-js": "0.4.27",
     "@enbox/dwn-server": "0.1.43",
     "playwright": "1.55.1"
   }

@@ -11,6 +11,7 @@ import { runDidRuntimeProof } from '../proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from '../doctor.js';
 import { runPrivateBrowserDidProof } from '../proofs/did-browser/did-browser-proof.js';
 import { runRoutingProof } from '../proofs/routing/routing-proof.js';
+import { runServerPrivateDidProof } from '../proofs/did-server/server-private-did-proof.js';
 
 export type ProofContract = {
   pass: readonly string[];
@@ -77,7 +78,6 @@ export const linuxProofContracts = {
     unsupported : [
       'A10-default-runtime-did-network',
       'A03-service-worker-did-containment',
-      'A10-server-private-did-ingress',
     ],
   },
   catalog: {
@@ -114,6 +114,17 @@ export const linuxProofContracts = {
       'A11-advertised-endpoint-route',
       'A09-retention-soak',
     ],
+  },
+  serverDid: {
+    pass: [
+      'A06-server-private-testnets',
+      'A03-server-private-did-cross-lab-isolation',
+      'A10-server-private-did-ingress',
+      'A10-server-private-did-signature-enforcement',
+      'server-private-did-runtime-cleanup',
+    ],
+    proof       : 'p0-server-private-did-ingress',
+    unsupported : [],
   },
   doctor: {
     pass        : ['bun', 'docker-engine', 'chromium', 'platform'],
@@ -289,6 +300,12 @@ async function run(options: CliOptions): Promise<number> {
     evidenceDirectory : options.evidenceDirectory,
     filename          : 'browser-private-did.json',
     run               : runPrivateBrowserDidProof,
+  }));
+  entries.push(await runEvidence({
+    contract          : linuxProofContracts.serverDid,
+    evidenceDirectory : options.evidenceDirectory,
+    filename          : 'server-private-did.json',
+    run               : runServerPrivateDidProof,
   }));
   entries.push(await runEvidence({
     contract          : linuxProofContracts.browserConnect,
