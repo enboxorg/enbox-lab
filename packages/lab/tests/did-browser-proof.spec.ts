@@ -309,7 +309,6 @@ describe('Browser private DID proof verdicts', () => {
       expect.objectContaining({ id: 'transport-check', status: 'pass' }),
       expect.objectContaining({ id: 'A10-default-runtime-did-network', status: 'unsupported' }),
       expect.objectContaining({ id: 'A03-service-worker-did-containment', status: 'unsupported' }),
-      expect.objectContaining({ id: 'A10-server-private-did-ingress', status: 'unsupported' }),
       expect.objectContaining({ id: 'browser-private-did-runtime-cleanup', status: 'pass' }),
     ]));
   });

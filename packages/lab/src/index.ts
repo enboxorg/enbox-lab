@@ -28,6 +28,8 @@ export type { PrivateBrowserDidProofOptions } from './proofs/did-browser/did-bro
 export { runPrivateBrowserDidProof } from './proofs/did-browser/did-browser-proof.js';
 export * from './proofs/did-persistence-proof.js';
 export * from './proofs/did-runtime/did-runtime-proof.js';
+export type { ServerPrivateDidProofOptions } from './proofs/did-server/server-private-did-proof.js';
+export { runServerPrivateDidProof } from './proofs/did-server/server-private-did-proof.js';
 export * from './proofs/routing/index.js';
 export * from './runtime/chromium.js';
 export * from './runtime/private-pkarr-testnet.js';

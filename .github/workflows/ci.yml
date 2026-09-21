@@ -42,7 +42,15 @@ jobs:
         run: bun run build
 
       - name: Smoke-test the built CLI
-        run: bun packages/lab/dist/esm/cli.js --help
+        shell: bash
+        run: |
+          bun packages/lab/dist/esm/cli.js --help
+          set +e
+          bun packages/lab/dist/esm/cli.js did-server --invalid > "${{ runner.temp }}/did-server-invalid.txt" 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 2
+          grep -q 'did-server' "${{ runner.temp }}/did-server-invalid.txt"
 
       - name: Run unit tests with coverage
         run: bun run test:coverage

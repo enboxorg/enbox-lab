@@ -449,11 +449,6 @@ async function runPrivateBrowserDidProofWithDependencies(
       status  : 'unsupported',
       summary : 'Service-worker DID traffic containment remains part of the full browser actor E2E',
     });
-    checks.push({
-      id      : 'A10-server-private-did-ingress',
-      status  : 'unsupported',
-      summary : 'Server-side DID resolution needs a separate authenticated or private-network ingress to the durable gateway',
-    });
   } catch (error: unknown) {
     const logs = await testnet.logs();
     checks.push({
