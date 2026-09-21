@@ -12,7 +12,7 @@
     "lint:fix": "bun run --filter @enbox/lab lint:fix",
     "setup:browser": "bun run --filter @enbox/lab setup:browser",
     "setup:browser:ci": "bun run --filter @enbox/lab setup:browser:ci",
-    "test:coverage": "bun run --filter @enbox/lab test:node:coverage",
+    "test:coverage": "bun run --filter @enbox/lab test:node:coverage && bun packages/lab/src/ci/check-coverage.ts packages/lab/coverage/lcov.info 65",
     "test:node": "bun run --filter @enbox/lab test:node",
     "typecheck": "bun run --filter @enbox/lab typecheck",
     "verify:linux": "bun packages/lab/src/ci/verify-linux-proofs.ts"

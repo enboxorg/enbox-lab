@@ -1,9 +1,9 @@
 import type { LabCheck, LabProofReport } from './proof-result.js';
 
 import { access } from 'node:fs/promises';
-import { chromium } from 'playwright';
 import { constants } from 'node:fs';
 import { createProofReport } from './proof-result.js';
+import { findChromiumExecutable } from './runtime/chromium.js';
 
 const EXPECTED_BUN_VERSION = '1.3.14';
 const SUPPORTED_ARCHITECTURES = new Set(['arm64', 'x64']);
@@ -65,21 +65,29 @@ function commandCheck(id: string, name: string, result: CommandResult): LabCheck
   };
 }
 
-async function browserCheck(browserExecutablePath: string): Promise<LabCheck> {
+async function browserCheck(browserExecutablePath: string | undefined): Promise<LabCheck> {
+  if (browserExecutablePath === undefined) {
+    return {
+      details : { executablePath: '' },
+      id      : 'chromium',
+      status  : 'fail',
+      summary : 'Chromium executable is not installed',
+    };
+  }
   try {
     await access(browserExecutablePath, constants.X_OK);
     return {
       details : { executablePath: browserExecutablePath },
       id      : 'chromium',
       status  : 'pass',
-      summary : 'Managed Chromium executable is installed',
+      summary : 'Chromium executable is installed',
     };
   } catch {
     return {
       details : { executablePath: browserExecutablePath },
       id      : 'chromium',
       status  : 'fail',
-      summary : 'Managed Chromium executable is not installed or executable',
+      summary : 'Chromium executable is not installed or executable',
     };
   }
 }
@@ -91,7 +99,7 @@ export async function runDoctor(dependencies: LabDoctorDependencies = {}): Promi
   const runner = dependencies.runCommand ?? runCommand;
   const architecture = dependencies.architecture ?? process.arch;
   const platform = dependencies.platform ?? process.platform;
-  const browserExecutablePath = dependencies.browserExecutablePath ?? chromium.executablePath();
+  const browserExecutablePath = findChromiumExecutable(dependencies.browserExecutablePath);
 
   const [bunVersion, dockerVersion, chromiumCheck] = await Promise.all([
     runner(['bun', '--version']),

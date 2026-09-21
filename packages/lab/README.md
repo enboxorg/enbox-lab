@@ -8,5 +8,6 @@ Run commands from the repository root:
 bun packages/lab/src/cli.ts doctor --json
 bun packages/lab/src/cli.ts catalog --repository ../enbox --mode source --json
 bun packages/lab/src/cli.ts routing --json
+bun packages/lab/src/cli.ts did-browser --json
 bun packages/lab/src/cli.ts did-runtime --json
 ```

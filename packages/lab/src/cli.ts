@@ -7,12 +7,14 @@ import { runCatalogPreflightCli } from './catalog/preflight.js';
 import { runDidRuntimeProof } from './proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from './doctor.js';
 import { runHistoricalArtifactBuildCli } from './catalog/build.js';
+import { runPrivateBrowserDidProof } from './proofs/did-browser/did-browser-proof.js';
 import { runRoutingProof } from './proofs/routing/routing-proof.js';
 
 const usage = `enbox-lab <command> [options]
 
 Commands:
   catalog      Verify pinned historical DWN source or fixture capabilities.
+  did-browser  Run real Chromium did:dht publication through an owned private gateway.
   did-runtime  Run the owned private-Pkarr restart and restoration proof.
   doctor       Inspect prerequisites for the P0 proof harnesses.
   prepare      Materialize and prepare one pinned historical artifact.
@@ -57,6 +59,21 @@ async function run(): Promise<number> {
     }
     const report = await runDidRuntimeProof();
     if (didArgs.includes('--json')) {
+      console.log(JSON.stringify(report, undefined, 2));
+    } else {
+      printTextReport(report);
+    }
+    return exitCodeForProofStatus(report.status);
+  }
+
+  if (command === 'did-browser') {
+    const didBrowserArgs = args.slice(1);
+    if (didBrowserArgs.some((argument): boolean => argument !== '--json')) {
+      console.error(usage);
+      return 2;
+    }
+    const report = await runPrivateBrowserDidProof();
+    if (didBrowserArgs.includes('--json')) {
       console.log(JSON.stringify(report, undefined, 2));
     } else {
       printTextReport(report);

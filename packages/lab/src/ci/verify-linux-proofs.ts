@@ -8,6 +8,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { runCatalogPreflight } from '../catalog/catalog-preflight.js';
 import { runDidRuntimeProof } from '../proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from '../doctor.js';
+import { runPrivateBrowserDidProof } from '../proofs/did-browser/did-browser-proof.js';
 import { runRoutingProof } from '../proofs/routing/routing-proof.js';
 
 export type ProofContract = {
@@ -41,6 +42,21 @@ Runs the real Linux proof suite and verifies its exact pass/unsupported contract
 `;
 
 export const linuxProofContracts = {
+  browserDid: {
+    pass: [
+      'A06-browser-private-testnet',
+      'A10-browser-direct-did-network-subcheck',
+      'A03-browser-did-origin-allowlist-subcheck',
+      'browser-did-proof-cleanup',
+      'browser-private-did-runtime-cleanup',
+    ],
+    proof       : 'p0-browser-private-did-boundary',
+    unsupported : [
+      'A10-default-runtime-did-network',
+      'A03-service-worker-did-containment',
+      'A10-server-private-did-ingress',
+    ],
+  },
   catalog: {
     pass: [
       'dwn-server-0.1.43.commit',
@@ -236,6 +252,12 @@ async function run(options: CliOptions): Promise<number> {
     evidenceDirectory : options.evidenceDirectory,
     filename          : 'routing.json',
     run               : runRoutingProof,
+  }));
+  entries.push(await runEvidence({
+    contract          : linuxProofContracts.browserDid,
+    evidenceDirectory : options.evidenceDirectory,
+    filename          : 'browser-private-did.json',
+    run               : runPrivateBrowserDidProof,
   }));
   entries.push(await runEvidence({
     contract          : linuxProofContracts.didRuntime,
