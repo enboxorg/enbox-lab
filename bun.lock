@@ -23,6 +23,7 @@
         "enbox-lab": "./dist/esm/cli.js",
       },
       "dependencies": {
+        "@enbox/agent": "0.8.48",
         "@enbox/browser": "0.3.79",
         "@enbox/connect": "0.1.23",
         "@enbox/crypto": "0.1.11",
