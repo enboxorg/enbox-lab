@@ -48,6 +48,8 @@ The Linux routing candidate assigns a distinct `http://localhost:<actor-port>` o
 
 The durable Pkarr adapter stores only upstream-accepted signed public packets. It rejects stale or conflicting equal-sequence packets, bounds the journal, replays without request fanout, retains exact bytes and sequence precision, restores before readiness, and never serves resolution from its journal.
 
+The browser DID proof uses a frozen actor bootstrap and a typed service worker to make one causally attributed private lookup. It rejects reconfiguration, unconfigured sibling clients, and foreign-worker traffic before unexpected upstream access.
+
 The server DID proof starts two independently owned private Pkarr testnets and the exact released DWN server in isolated child processes. A DID published only in lab A authenticates at A, fails resolution at B, and still resolves before a tampered signature is rejected; resolver observations prove each server used only its assigned ingress.
 
 All proof reports use `pass`, `fail`, and `unsupported`. Unsupported evidence never counts as a passing P0 or release gate.

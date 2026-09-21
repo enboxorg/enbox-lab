@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { assertCoverage, assertFileCoverage, parseLcov } from '../src/ci/check-coverage.js';
+import { assertCoverage, assertFileCoverage, criticalCoverageFloors, parseLcov } from '../src/ci/check-coverage.js';
 
 describe('coverage gate', () => {
   it('should aggregate LCOV line totals and enforce the configured floor', () => {
@@ -30,5 +30,10 @@ end_of_record
   it('should fail empty reports and invalid thresholds', () => {
     expect((): void => assertCoverage(parseLcov(''), 0)).toThrow('below');
     expect((): void => assertCoverage(parseLcov(''), 101)).toThrow('between 0 and 100');
+  });
+
+  it('should keep the browser runtime and worker parser on critical coverage floors', () => {
+    expect(criticalCoverageFloors['src/proofs/did-browser/did-browser-runtime.ts']).toBe(20);
+    expect(criticalCoverageFloors['src/proofs/did-browser/fixture/did-service-worker-protocol.ts']).toBe(85);
   });
 });
