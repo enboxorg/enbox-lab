@@ -4,6 +4,7 @@ import type { LabCheck, LabProofReport } from './proof-result.js';
 
 import { exitCodeForProofStatus } from './proof-result.js';
 import { runCatalogPreflightCli } from './catalog/preflight.js';
+import { runConnectBrowserProof } from './proofs/connect/connect-browser-proof.js';
 import { runDidRuntimeProof } from './proofs/did-runtime/did-runtime-proof.js';
 import { runDoctor } from './doctor.js';
 import { runHistoricalArtifactBuildCli } from './catalog/build.js';
@@ -14,6 +15,7 @@ const usage = `enbox-lab <command> [options]
 
 Commands:
   catalog      Verify pinned historical DWN source or fixture capabilities.
+  connect-browser  Run real Chromium popup and relay connect denial boundaries.
   did-browser  Run real Chromium did:dht publication through an owned private gateway.
   did-runtime  Run the owned private-Pkarr restart and restoration proof.
   doctor       Inspect prerequisites for the P0 proof harnesses.
@@ -74,6 +76,21 @@ async function run(): Promise<number> {
     }
     const report = await runPrivateBrowserDidProof();
     if (didBrowserArgs.includes('--json')) {
+      console.log(JSON.stringify(report, undefined, 2));
+    } else {
+      printTextReport(report);
+    }
+    return exitCodeForProofStatus(report.status);
+  }
+
+  if (command === 'connect-browser') {
+    const connectBrowserArgs = args.slice(1);
+    if (connectBrowserArgs.some((argument): boolean => argument !== '--json')) {
+      console.error(usage);
+      return 2;
+    }
+    const report = await runConnectBrowserProof();
+    if (connectBrowserArgs.includes('--json')) {
       console.log(JSON.stringify(report, undefined, 2));
     } else {
       printTextReport(report);

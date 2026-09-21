@@ -1,0 +1,45 @@
+export type BrowserConnectObservation = {
+  authorizeReplayStatus: number;
+  authorizeStatus: number;
+  browserVersion: string;
+  callbackStatus: number;
+  cancelledFlowPendingObserved: boolean;
+  claimedObserved: boolean;
+  dappOrigin: string;
+  executablePath: string;
+  fragmentSecretReachedNetwork: boolean;
+  freshRelayIdentifiersDistinct: boolean;
+  oldHandleRejectedAfterRestart: boolean;
+  pollingStoppedAfterCancellation: boolean;
+  popupDenied: boolean;
+  popupDappWrongOriginIgnored: boolean;
+  popupDappWrongSourceIgnored: boolean;
+  popupOriginMismatchRejected: boolean;
+  popupOtherPrincipalRejected: boolean;
+  popupOversizedEnvelopeRejected: boolean;
+  popupPermissionRequestCount: number;
+  popupWrongOriginIgnored: boolean;
+  popupWrongSourceIgnored: boolean;
+  relayDenied: boolean;
+  relayOrigin: string;
+  relayPermissionRequestCount: number;
+  relayRequestPinCalls: number;
+  relayRequestKeyZeroed: boolean;
+  relayRuntimeIsolated: boolean;
+  relayServerVersion: string;
+  routePolicyRejections: number;
+  tokenConsumedStatus: number;
+  tokenStatuses: number[];
+  unexpectedNetworkOrigin: boolean;
+  unexpectedRelayRoute: boolean;
+  walletOrigin: string;
+  workerMalformedCommandsRejected: boolean;
+};
+
+export type BrowserConnectScenarioOutcome = {
+  browserCleanupErrors: string[];
+  executionError?: string;
+  observation?: BrowserConnectObservation;
+  relayCleanupErrors: string[];
+  relayStopped: boolean;
+};
