@@ -8,14 +8,18 @@ import type {
 import { describe, expect, it } from 'bun:test';
 
 import {
+  CONNECT_WORKER_MAX_JWE_BYTES,
   CONNECT_WORKER_MAX_REQUEST_BYTES,
   ConnectWorkerBoundaryError,
   ConnectWorkerSessionRegistry,
+  fetchBoundedRelayRequest,
+  validateRelayRequestUriForPrefetch,
 } from '../src/proofs/connect/connect-worker-boundary.js';
 
 const CONTEXT: ConnectWorkerRequestContext = { principalId: 'lab-1/wallet-1/provider-page' };
 const DAPP_ORIGIN = 'http://localhost:18443';
 const RELAY_ORIGIN = 'http://localhost:18444';
+const RELAY_REQUEST_URI = `${RELAY_ORIGIN}/connect/authorize/550e8400-e29b-41d4-a716-446655440000.jwt`;
 
 function createRequest(reply: ConnectRequest['reply'] = { mode: 'post_message' }): ConnectRequest {
   return {
@@ -172,7 +176,7 @@ describe('connect worker session binding', () => {
     }), 'invalid-channel');
 
     expectBoundaryError((): unknown => registry.bind({
-      channel   : { kind: 'relay', requestUri: `${RELAY_ORIGIN}/connect/authorize/request.jwt` },
+      channel   : { kind: 'relay', requestUri: RELAY_REQUEST_URI },
       context   : CONTEXT,
       request   : createRequest({ mode: 'direct_post', callbackUrl: 'https://attacker.example/connect/callback' }),
       transport : 'relay',
@@ -193,6 +197,144 @@ describe('connect worker session binding', () => {
       request   : createRequest({ mode: 'direct_post', callbackUrl: `${RELAY_ORIGIN}/connect/callback` }),
       transport : 'relay',
     }), 'invalid-channel');
+  });
+
+  it('should validate a canonical relay request URI against a caller-owned origin before fetching', () => {
+    expect(validateRelayRequestUriForPrefetch(RELAY_REQUEST_URI, RELAY_ORIGIN)).toBe(RELAY_REQUEST_URI);
+  });
+
+  it('should fetch a canonical relay request with a redirect-blocking bounded reader', async () => {
+    let redirect: RequestRedirect | undefined;
+    const jwe = await fetchBoundedRelayRequest({
+      fetchFn: async (_input, init): Promise<Response> => {
+        redirect = init?.redirect;
+        return new Response('compact-jwe', { headers: { 'Content-Length': '11' } });
+      },
+      relayOrigin : RELAY_ORIGIN,
+      requestUri  : RELAY_REQUEST_URI,
+    });
+
+    expect(jwe).toBe('compact-jwe');
+    expect(redirect).toBe('error');
+  });
+
+  it('should reject fixed-length and streamed relay envelopes above the worker limit', async () => {
+    await expect(fetchBoundedRelayRequest({
+      fetchFn: async (): Promise<Response> => new Response('oversized', {
+        headers: { 'Content-Length': String(CONNECT_WORKER_MAX_JWE_BYTES + 1) },
+      }),
+      relayOrigin : RELAY_ORIGIN,
+      requestUri  : RELAY_REQUEST_URI,
+    })).rejects.toMatchObject({ code: 'invalid-request' });
+
+    const oversizedStream = new ReadableStream<Uint8Array>({
+      start(controller): void {
+        controller.enqueue(new Uint8Array(CONNECT_WORKER_MAX_JWE_BYTES));
+        controller.enqueue(new Uint8Array(1));
+        controller.close();
+      },
+    });
+    await expect(fetchBoundedRelayRequest({
+      fetchFn     : async (): Promise<Response> => new Response(oversizedStream),
+      relayOrigin : RELAY_ORIGIN,
+      requestUri  : RELAY_REQUEST_URI,
+    })).rejects.toMatchObject({ code: 'invalid-request' });
+  });
+
+  it('should reject unsafe relay request URIs before fetching', () => {
+    const unsafeRequestUris = [
+      `https://attacker.example/connect/authorize/550e8400-e29b-41d4-a716-446655440000.jwt`,
+      `http://user:password@localhost:18444/connect/authorize/550e8400-e29b-41d4-a716-446655440000.jwt`,
+      `${RELAY_REQUEST_URI}?`,
+      `${RELAY_REQUEST_URI}?next=https://attacker.example`,
+      `${RELAY_REQUEST_URI}#`,
+      `${RELAY_REQUEST_URI}#fragment`,
+      `${RELAY_ORIGIN}/connect/authorize/not-a-uuid.jwt`,
+      `${RELAY_ORIGIN}/connect/authorize/550E8400-E29B-41D4-A716-446655440000.jwt`,
+      `${RELAY_ORIGIN}/connect/authorize/550e8400-e29b-41d4-a716-446655440000`,
+      `${RELAY_ORIGIN}/connect/authorize/550e8400-e29b-41d4-a716-446655440000.jwt/extra`,
+    ];
+
+    for (const requestUri of unsafeRequestUris) {
+      expectBoundaryError(
+        (): string => validateRelayRequestUriForPrefetch(requestUri, RELAY_ORIGIN),
+        'invalid-channel',
+      );
+    }
+  });
+
+  it('should require the caller-owned relay origin and popup origins to be literal origins', () => {
+    const registry = new ConnectWorkerSessionRegistry();
+    for (const relayOrigin of [
+      `${RELAY_ORIGIN}/`,
+      `${RELAY_ORIGIN}/connect`,
+      `${RELAY_ORIGIN}?`,
+      `${RELAY_ORIGIN}?query`,
+      `${RELAY_ORIGIN}#`,
+      `${RELAY_ORIGIN}#fragment`,
+      'http://user:password@localhost:18444',
+    ]) {
+      expectBoundaryError(
+        (): string => validateRelayRequestUriForPrefetch(RELAY_REQUEST_URI, relayOrigin),
+        'invalid-channel',
+      );
+    }
+
+    const request = createRequest();
+    request.clientMetadata = { origin: `${DAPP_ORIGIN}/path` };
+    expectBoundaryError((): unknown => registry.bind({
+      channel   : { dappOrigin: `${DAPP_ORIGIN}/path`, kind: 'popup' },
+      context   : CONTEXT,
+      request,
+      transport : 'postMessage',
+    }), 'invalid-channel');
+  });
+
+  it('should require canonical same-origin relay request and callback routes when binding', () => {
+    const registry = new ConnectWorkerSessionRegistry();
+    const invalidRequestUris = [
+      `${RELAY_ORIGIN}/connect/authorize/request.jwt`,
+      `${RELAY_REQUEST_URI}?query`,
+      `${RELAY_REQUEST_URI}#fragment`,
+    ];
+    for (const requestUri of invalidRequestUris) {
+      expectBoundaryError((): unknown => registry.bind({
+        channel   : { kind: 'relay', requestUri },
+        context   : CONTEXT,
+        request   : createRequest({ mode: 'direct_post', callbackUrl: `${RELAY_ORIGIN}/connect/callback` }),
+        transport : 'relay',
+      }), 'invalid-channel');
+    }
+
+    const invalidCallbacks = [
+      `${RELAY_ORIGIN}/connect/callback/`,
+      `${RELAY_ORIGIN}/connect/callback?`,
+      `${RELAY_ORIGIN}/connect/callback?query`,
+      `${RELAY_ORIGIN}/connect/callback#`,
+      `${RELAY_ORIGIN}/connect/callback#fragment`,
+      `${RELAY_ORIGIN}/other`,
+      'http://user:password@localhost:18444/connect/callback',
+      'https://attacker.example/connect/callback',
+    ];
+    for (const callbackUrl of invalidCallbacks) {
+      expectBoundaryError((): unknown => registry.bind({
+        channel   : { kind: 'relay', requestUri: RELAY_REQUEST_URI },
+        context   : CONTEXT,
+        request   : createRequest({ mode: 'direct_post', callbackUrl }),
+        transport : 'relay',
+      }), 'invalid-channel');
+    }
+
+    const bound = registry.bind({
+      channel   : { kind: 'relay', requestUri: RELAY_REQUEST_URI },
+      context   : CONTEXT,
+      request   : createRequest({ mode: 'direct_post', callbackUrl: `${RELAY_ORIGIN}/connect/callback` }),
+      transport : 'relay',
+    });
+    expect(registry.claimForApproval(CONTEXT, bound.handle).channel).toEqual({
+      kind       : 'relay',
+      requestUri : RELAY_REQUEST_URI,
+    });
   });
 
 });

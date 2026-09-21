@@ -11,7 +11,7 @@ import { CONNECT_WORKER_MAX_JWE_BYTES, ConnectWorkerSessionRegistry } from '../s
 
 const CONTEXT = { principalId: 'lab-1/wallet-1/relay-connect' };
 const RELAY_ORIGIN = 'http://localhost:18445';
-const REQUEST_URI = `${RELAY_ORIGIN}/connect/authorize/request.jwt`;
+const REQUEST_URI = `${RELAY_ORIGIN}/connect/authorize/550e8400-e29b-41d4-a716-446655440000.jwt`;
 
 async function createSealedRelayRequest(requestKey: Uint8Array): Promise<{ jwe: string; request: ConnectRequest }> {
   const clientDid = await DidJwk.create();
