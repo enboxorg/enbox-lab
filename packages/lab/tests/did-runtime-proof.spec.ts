@@ -56,19 +56,30 @@ describe('P0 real Pkarr persistence proof', () => {
       if (joined.startsWith('docker network ls --quiet')) {
         return result('network-id');
       }
-      if (joined.includes('--format {{json .Config}}')) {
+      if (joined.startsWith('docker inspect') && joined.includes('--format {{json .}}')) {
         return result(JSON.stringify({
-          Cmd    : ['pkarr-relay', '--testnet'],
-          Image  : PKARR_RELAY_IMAGE,
-          Labels : {
-            'org.enbox.lab.ownership-id' : '33333333-3333-4333-8333-333333333333',
-            'org.enbox.lab.proof-run-id' : '11111111-1111-4111-8111-111111111111',
+          Config: {
+            Cmd    : ['pkarr-relay', '--testnet'],
+            Image  : PKARR_RELAY_IMAGE,
+            Labels : {
+              'org.enbox.lab.actor-id'     : 'pkarr-relay',
+              'org.enbox.lab.display-name' : 'DID Persistence Proof',
+              'org.enbox.lab.lab-id'       : '22222222-2222-4222-8222-222222222222',
+              'org.enbox.lab.ownership-id' : '33333333-3333-4333-8333-333333333333',
+              'org.enbox.lab.proof-run-id' : '11111111-1111-4111-8111-111111111111',
+            },
+          },
+          NetworkSettings: {
+            Networks: { 'enbox-did-111111111111': {} },
           },
         }));
       }
       if (joined.startsWith('docker network inspect') && joined.includes('--format {{json .}}')) {
         return result(JSON.stringify({
-          Labels: {
+          Containers : { 'relay-container-2': {} },
+          Labels     : {
+            'org.enbox.lab.display-name' : 'DID Persistence Proof',
+            'org.enbox.lab.lab-id'       : '22222222-2222-4222-8222-222222222222',
             'org.enbox.lab.ownership-id' : '33333333-3333-4333-8333-333333333333',
             'org.enbox.lab.proof-run-id' : '11111111-1111-4111-8111-111111111111',
           },
