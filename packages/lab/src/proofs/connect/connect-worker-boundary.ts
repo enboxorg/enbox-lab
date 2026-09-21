@@ -1,4 +1,4 @@
-import type { ConnectRequest, ConnectSessionTransport } from '@enbox/connect';
+import type { ConnectRequest, ConnectSessionTransport, FetchFn } from '@enbox/connect';
 
 import { assertConnectRequest, ConnectProvider } from '@enbox/connect';
 
@@ -20,6 +20,7 @@ export const CONNECT_WORKER_MAX_JWE_BYTES = 131_072;
 const CONNECT_WORKER_REQUEST_KEY_BYTES = 32;
 const CONNECT_WORKER_MAX_ORIGIN_BYTES = 2_048;
 const CONNECT_WORKER_MAX_RELAY_URI_BYTES = 8_192;
+const CONNECT_RELAY_REQUEST_PATH = /^\/connect\/authorize\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jwt$/;
 const textEncoder = new TextEncoder();
 
 export type ConnectWorkerSessionHandle = Readonly<{
@@ -137,8 +138,8 @@ function normalizeHttpOrigin(origin: unknown, field: string): string {
     throw new ConnectWorkerBoundaryError('invalid-channel', `${field} must be an absolute HTTP(S) URL.`);
   }
 
-  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin === 'null') {
-    throw new ConnectWorkerBoundaryError('invalid-channel', `${field} must use HTTP or HTTPS.`);
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin === 'null' || origin !== url.origin) {
+    throw new ConnectWorkerBoundaryError('invalid-channel', `${field} must be a literal HTTP(S) origin.`);
   }
   return url.origin;
 }
@@ -154,13 +155,118 @@ function normalizeRelayRequestUri(requestUri: unknown): string {
     throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay request URI must be an absolute HTTP(S) URL.');
   }
 
-  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username !== '' || url.password !== '' || url.hash !== '') {
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin === 'null' ||
+    url.username !== '' || url.password !== '' || requestUri.includes('?') || requestUri.includes('#')) {
     throw new ConnectWorkerBoundaryError(
       'invalid-channel',
-      'Relay request URI must use HTTP(S) and must not contain credentials or a fragment.',
+      'Relay request URI must use HTTP(S) and must not contain credentials, a query, or a fragment.',
     );
   }
-  return url.toString();
+  if (!CONNECT_RELAY_REQUEST_PATH.test(url.pathname) || requestUri !== `${url.origin}${url.pathname}`) {
+    throw new ConnectWorkerBoundaryError(
+      'invalid-channel',
+      'Relay request URI must use the canonical /connect/authorize/<UUID>.jwt route.',
+    );
+  }
+  return requestUri;
+}
+
+function normalizeRelayCallbackOrigin(callbackUrl: unknown): string {
+  if (typeof callbackUrl !== 'string' || textEncoder.encode(callbackUrl).byteLength > CONNECT_WORKER_MAX_RELAY_URI_BYTES) {
+    throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay callback URL must be an absolute HTTP(S) URL.');
+  }
+  let url: URL;
+  try {
+    url = new URL(callbackUrl);
+  } catch {
+    throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay callback URL must be an absolute HTTP(S) URL.');
+  }
+
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin === 'null' ||
+    url.username !== '' || url.password !== '' || callbackUrl.includes('?') || callbackUrl.includes('#') ||
+    callbackUrl !== `${url.origin}/connect/callback`) {
+    throw new ConnectWorkerBoundaryError(
+      'invalid-channel',
+      'Relay callback URL must use the canonical /connect/callback route without credentials, a query, or a fragment.',
+    );
+  }
+  return url.origin;
+}
+
+/**
+ * Validates a relay request URI before any network fetch.
+ *
+ * The caller supplies the relay origin from its own trusted configuration. The
+ * returned URI is byte-for-byte canonical and cannot redirect the prefetch to
+ * another origin or route through URL credentials, query parameters, or a
+ * fragment.
+ */
+export function validateRelayRequestUriForPrefetch(requestUri: unknown, relayOrigin: unknown): string {
+  const expectedOrigin = normalizeHttpOrigin(relayOrigin, 'Caller-owned relay origin');
+  const normalizedRequestUri = normalizeRelayRequestUri(requestUri);
+  if (new URL(normalizedRequestUri).origin !== expectedOrigin) {
+    throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay request URI must match the caller-owned relay origin.');
+  }
+  return normalizedRequestUri;
+}
+
+/** Fetches one single-use relay request without buffering beyond the worker envelope limit. */
+export async function fetchBoundedRelayRequest(params: {
+  fetchFn?: FetchFn;
+  relayOrigin: string;
+  requestUri: string;
+  timeoutMs?: number;
+}): Promise<string> {
+  const requestUri = validateRelayRequestUriForPrefetch(params.requestUri, params.relayOrigin);
+  const response = await (params.fetchFn ?? globalThis.fetch)(requestUri, {
+    redirect : 'error',
+    signal   : AbortSignal.timeout(params.timeoutMs ?? 30_000),
+  });
+  if (!response.ok) {
+    await response.body?.cancel().catch((): void => {});
+    throw new ConnectWorkerBoundaryError(
+      'invalid-request',
+      `Connect worker failed to fetch the single-use relay request (HTTP ${response.status}).`,
+    );
+  }
+
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (!Number.isSafeInteger(declaredBytes) || declaredBytes < 0 || declaredBytes > CONNECT_WORKER_MAX_JWE_BYTES) {
+      await response.body?.cancel().catch((): void => {});
+      throw new ConnectWorkerBoundaryError('invalid-request', 'Connect worker relay envelope exceeds its size limit.');
+    }
+  }
+
+  if (response.body === null) {
+    return '';
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let receivedBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) { break; }
+      receivedBytes += value.byteLength;
+      if (receivedBytes > CONNECT_WORKER_MAX_JWE_BYTES) {
+        await reader.cancel();
+        throw new ConnectWorkerBoundaryError('invalid-request', 'Connect worker relay envelope exceeds its size limit.');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(receivedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 function validateContext(context: unknown): asserts context is ConnectWorkerRequestContext {
@@ -362,7 +468,7 @@ export class ConnectWorkerSessionRegistry {
       throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay sessions require a direct_post connect request.');
     }
     const requestUri = normalizeRelayRequestUri(channel.requestUri);
-    const callbackOrigin = normalizeHttpOrigin(request.reply.callbackUrl, 'Relay callback URL');
+    const callbackOrigin = normalizeRelayCallbackOrigin(request.reply.callbackUrl);
     if (new URL(requestUri).origin !== callbackOrigin) {
       throw new ConnectWorkerBoundaryError('invalid-channel', 'Relay callback origin must match the claimed request origin.');
     }
