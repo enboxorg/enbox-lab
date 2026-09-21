@@ -32,8 +32,10 @@ end_of_record
     expect((): void => assertCoverage(parseLcov(''), 101)).toThrow('between 0 and 100');
   });
 
-  it('should keep the browser runtime and worker parser on critical coverage floors', () => {
+  it('should keep browser and agent-process boundaries on critical coverage floors', () => {
     expect(criticalCoverageFloors['src/proofs/did-browser/did-browser-runtime.ts']).toBe(20);
     expect(criticalCoverageFloors['src/proofs/did-browser/fixture/did-service-worker-protocol.ts']).toBe(85);
+    expect(criticalCoverageFloors['src/runtime/agent-process/agent-process-child-protocol.ts']).toBe(90);
+    expect(criticalCoverageFloors['src/runtime/agent-process/agent-process-runtime.ts']).toBe(90);
   });
 });

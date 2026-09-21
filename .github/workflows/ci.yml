@@ -41,6 +41,23 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Smoke-test the built agent child
+        shell: bash
+        run: |
+          child_directory="${{ runner.temp }}/agent-child-smoke"
+          protocol_output="${{ runner.temp }}/agent-child-smoke.ndjson"
+          error_output="${{ runner.temp }}/agent-child-smoke.stderr"
+          mkdir -p "$child_directory"
+          jq -nc \
+            --arg storageDirectory "$child_directory" \
+            '{actorGatewayUri:"http://127.0.0.1:9/",remoteDwnOrigin:"http://127.0.0.1:10",$storageDirectory,type:"start"}' \
+            | bun packages/lab/dist/esm/runtime/agent-process/agent-process-child.js \
+              > "$protocol_output" 2> "$error_output"
+          test ! -s "$error_output"
+          jq -s -e \
+            'length == 2 and .[0].type == "awaiting-secret" and .[0].locked == true and .[0].firstLaunch == true and .[0].packageName == "@enbox/agent" and .[0].packageVersion == "0.8.48" and .[1] == {locked:true,type:"stopped"}' \
+            "$protocol_output"
+
       - name: Smoke-test the built CLI
         shell: bash
         run: |
