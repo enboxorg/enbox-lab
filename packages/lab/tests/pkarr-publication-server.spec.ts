@@ -125,6 +125,112 @@ describe('Pkarr publication server', () => {
     }
   });
 
+  it('should release startup resources when the primary listener cannot bind', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
+    const journalLocation = join(directory, 'journal.sqlite');
+    const blocker = Bun.serve({
+      fetch    : (): Response => new Response(),
+      hostname : '127.0.0.1',
+      port     : 0,
+    });
+    try {
+      await expect(startPkarrPublicationServer({
+        fetch           : async (): Promise<Response> => new Response(undefined, { status: 204 }),
+        journalLocation,
+        port            : blocker.port,
+        resolverIngress : true,
+        upstreamBaseUrl : 'http://pkarr:15411/',
+      })).rejects.toThrow();
+    } finally {
+      await blocker.stop(true);
+    }
+
+    const recovered = await startPkarrPublicationServer({
+      fetch           : async (): Promise<Response> => new Response(undefined, { status: 204 }),
+      journalLocation,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+    await recovered.stop();
+    await rm(directory, { force: true, recursive: true });
+  });
+
+  it('should expose a capability-guarded originless resolver without weakening the browser listener', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
+    let identifierGets = 0;
+    const server = await startPkarrPublicationServer({
+      allowedOrigins : ['http://localhost:18443'],
+      fetch          : async (input): Promise<Response> => {
+        const url = new URL(String(input));
+        if (url.pathname !== '/') {
+          identifierGets += 1;
+          return new Response('signed-packet', { status: 200 });
+        }
+        return new Response(undefined, { status: 404 });
+      },
+      journalLocation : join(directory, 'journal.sqlite'),
+      resolverIngress : true,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    try {
+      const endpoint = server.resolverEndpoint();
+      expect(endpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/__lab\/resolver\/[0-9a-f]{64}\/$/u);
+      if (endpoint === undefined) {
+        throw new Error('Expected the resolver ingress endpoint.');
+      }
+      const resolverUrl = new URL(endpoint);
+      const identifier = 'y'.repeat(52);
+      const validUrl = new URL(identifier, resolverUrl).toString();
+      const wrongCapability = validUrl.replace(
+        /\/resolver\/([0-9a-f])([0-9a-f]{63})\//u,
+        (_match, first: string, remainder: string): string => `/resolver/${first === '0' ? '1' : '0'}${remainder}/`,
+      );
+      const rejected: Array<{ headers?: HeadersInit; method?: string; url: string }> = [
+        { url: wrongCapability },
+        { url: `${validUrl}?query=1` },
+        { url: new URL('short', resolverUrl).toString() },
+        { url: new URL(`${'y'.repeat(51)}b`, resolverUrl).toString() },
+        { url: new URL('%2e%2e', resolverUrl).toString() },
+        { headers: { Origin: 'http://localhost:18443' }, url: validUrl },
+        { headers: { Origin: 'https://attacker.invalid' }, url: validUrl },
+        { headers: { Referer: 'http://localhost:18443/' }, url: validUrl },
+        { headers: { 'Sec-Fetch-Dest': 'image' }, url: validUrl },
+        { headers: { 'Sec-Fetch-Site': 'cross-site' }, url: validUrl },
+        { headers: { Host: 'evil.test' }, url: validUrl },
+        { method: 'OPTIONS', url: validUrl },
+        { method: 'PUT', url: validUrl },
+      ];
+      for (const request of rejected) {
+        const response = await fetch(request.url, { headers: request.headers, method: request.method });
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe('not found');
+      }
+      expect(identifierGets).toBe(0);
+
+      const browserOriginless = await fetch(new URL(identifier, server.endpoint));
+      expect(browserOriginless.status).toBe(403);
+      const response = await fetch(validUrl);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('signed-packet');
+      expect(response.headers.get('access-control-allow-origin')).toBeNull();
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(response.headers.get('content-security-policy')).toBe('default-src \'none\'; frame-ancestors \'none\'');
+      expect(response.headers.get('cross-origin-resource-policy')).toBe('same-origin');
+      expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(identifierGets).toBe(1);
+      expect(server.resolverObservation()).toEqual({ admitted: 1, rejected: rejected.length });
+      expect(JSON.stringify(server)).not.toContain(resolverUrl.pathname.split('/')[3]);
+
+      await server.stop();
+      await expect(fetch(validUrl, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
+      expect(server.resolverObservation()).toEqual({ admitted: 1, rejected: rejected.length });
+    } finally {
+      await server.stop();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it('should restore a nonempty journal before exposing readiness', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
     const journalLocation = join(directory, 'journal.sqlite');

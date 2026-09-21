@@ -17,11 +17,52 @@ export type PkarrPublicationServerOptions = {
   maxPublications?: number;
   port?: number;
   requestTimeoutMs?: number;
+  /** Starts a second capability-guarded loopback listener for originless server resolvers. */
+  resolverIngress?: boolean;
   shutdownTimeoutMs?: number;
   upstreamBaseUrl: string;
 };
 
 const MAX_ALLOWED_ORIGINS = 64;
+const DID_DHT_IDENTIFIER_PATTERN = /^[ybndrfg8ejkmcpqxot1uwisza345h769]{51}[yo]$/u;
+
+function randomCapability(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return [...bytes].map((byte): string => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function resolverHeaders(response?: Response): Headers {
+  const headers = new Headers(response?.headers);
+  headers.set('Cache-Control', 'no-store');
+  headers.set('Content-Security-Policy', 'default-src \'none\'; frame-ancestors \'none\'');
+  headers.set('Cross-Origin-Resource-Policy', 'same-origin');
+  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.delete('Access-Control-Allow-Origin');
+  return headers;
+}
+
+function resolverResponse(response: Response): Response {
+  return new Response(response.body, {
+    headers    : resolverHeaders(response),
+    status     : response.status,
+    statusText : response.statusText,
+  });
+}
+
+function resolverNotFound(): Response {
+  return new Response('not found', { headers: resolverHeaders(), status: 404 });
+}
+
+function hasBrowserRequestMetadata(headers: Headers): boolean {
+  let present = headers.has('origin') || headers.has('referer');
+  headers.forEach((_value, name): void => {
+    if (name.toLowerCase().startsWith('sec-fetch-')) {
+      present = true;
+    }
+  });
+  return present;
+}
 
 function normalizeAllowedOrigins(origins: readonly string[]): Set<string> {
   if (origins.length > MAX_ALLOWED_ORIGINS) {
@@ -93,6 +134,10 @@ function isPkarrPath(pathname: string): boolean {
 export type PkarrPublicationServer = {
   browserRejectionCount(): number;
   endpoint: string;
+  /** Returns the secret resolver base URI. Keep it out of logs, reports, URLs exposed to browsers, and argv. */
+  resolverEndpoint(): string | undefined;
+  /** Returns policy admission counters without exposing the capability. */
+  resolverObservation(): { admitted: number; rejected: number };
   restoreResults: PkarrRestoreResult[];
   stop(): Promise<void>;
 };
@@ -140,9 +185,39 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
 
   const hostname = options.hostname ?? '127.0.0.1';
   let browserRejections = 0;
-  let server: Server<undefined>;
+  let resolverAdmitted = 0;
+  let resolverRejected = 0;
+  let resolverOrigin: string | undefined;
+  let resolverServer: Server<undefined> | undefined;
+  let resolverUri: string | undefined;
+  let server: Server<undefined> | undefined;
   try {
-    adapter.startMaintenance(maintenanceIntervalMs);
+    if (options.resolverIngress === true) {
+      const capability = randomCapability();
+      const prefix = `/__lab/resolver/${capability}/`;
+      resolverServer = Bun.serve({
+        fetch: async (request): Promise<Response> => {
+          const url = new URL(request.url);
+          const hasBrowserHeader = hasBrowserRequestMetadata(request.headers);
+          const identifier = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) : '';
+          if (url.origin !== resolverOrigin || request.method !== 'GET' || url.search !== '' || hasBrowserHeader ||
+            !DID_DHT_IDENTIFIER_PATTERN.test(identifier)) {
+            resolverRejected += 1;
+            return resolverNotFound();
+          }
+          resolverAdmitted += 1;
+          return resolverResponse(await adapter.handle(new Request(`http://resolver.invalid/${identifier}`, {
+            method : 'GET',
+            signal : request.signal,
+          })));
+        },
+        hostname           : '127.0.0.1',
+        maxRequestBodySize : 1_024,
+        port               : 0,
+      });
+      resolverOrigin = `http://127.0.0.1:${resolverServer.port}`;
+      resolverUri = `${resolverOrigin}${prefix}`;
+    }
     server = Bun.serve({
       fetch: async (request): Promise<Response> => {
         const url = new URL(request.url);
@@ -175,25 +250,38 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
       maxRequestBodySize : PKARR_PACKET_MAX_BYTES,
       port               : options.port ?? 0,
     });
+    adapter.startMaintenance(maintenanceIntervalMs);
   } catch (error: unknown) {
+    await resolverServer?.stop(true);
+    await server?.stop(true);
     adapter.stopMaintenance();
     journal.close();
     throw error;
+  }
+  if (server === undefined) {
+    adapter.stopMaintenance();
+    journal.close();
+    throw new Error('Pkarr publication server did not create its primary listener.');
   }
 
   let stopPromise: Promise<void> | undefined;
   const stop = async (): Promise<void> => {
     adapter.beginShutdown();
-    const gracefulStop = Promise.all([Promise.resolve(server.stop(false)), adapter.drain()]);
+    const stopping = Promise.all([
+      Promise.resolve(resolverServer?.stop(true)),
+      Promise.resolve(server.stop(true)),
+      adapter.drain(),
+    ]);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const shutdownTimeout = new Promise<false>((resolve): void => {
       timeoutId = setTimeout((): void => { resolve(false); }, shutdownTimeoutMs);
     });
-    const stoppedGracefully = await Promise.race([gracefulStop.then((): true => true), shutdownTimeout]);
+    const stopped = await Promise.race([stopping.then((): true => true), shutdownTimeout]);
     clearTimeout(timeoutId);
-    if (!stoppedGracefully) {
+    if (!stopped) {
+      void resolverServer?.stop(true);
       void server.stop(true);
-      void gracefulStop.then((): void => { journal.close(); }).catch((): void => {});
+      void stopping.then((): void => { journal.close(); }).catch((): void => {});
       throw new Error(`Pkarr publication server did not drain within ${shutdownTimeoutMs} milliseconds.`);
     }
     journal.close();
@@ -201,8 +289,13 @@ export async function startPkarrPublicationServer(options: PkarrPublicationServe
   return {
     browserRejectionCount : (): number => browserRejections,
     endpoint              : `http://${hostname}:${server.port}/`,
+    resolverEndpoint      : (): string | undefined => resolverUri,
+    resolverObservation   : (): { admitted: number; rejected: number } => ({
+      admitted : resolverAdmitted,
+      rejected : resolverRejected,
+    }),
     restoreResults,
-    stop                  : (): Promise<void> => {
+    stop: (): Promise<void> => {
       if (stopPromise === undefined) {
         stopPromise = stop();
       }
