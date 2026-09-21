@@ -54,6 +54,8 @@ export const criticalCoverageFloors = {
   'src/proofs/connect/connect-worker-boundary.ts'       : 95,
   'src/proofs/connect/fixture/wallet-rpc-validation.ts' : 95,
   'src/proofs/did-browser/did-browser-proof.ts'         : 70,
+  'src/proofs/did-server/did-server-child-protocol.ts'  : 85,
+  'src/proofs/did-server/did-server-runtime.ts'         : 95,
   'src/proofs/docker-proof.ts'                          : 95,
   'src/runtime/private-pkarr-testnet.ts'                : 80,
 } as const;
