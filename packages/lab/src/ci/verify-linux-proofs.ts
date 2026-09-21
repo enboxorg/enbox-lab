@@ -71,13 +71,14 @@ export const linuxProofContracts = {
       'A06-browser-private-testnet',
       'A10-browser-direct-did-network-subcheck',
       'A03-browser-did-origin-allowlist-subcheck',
+      'A10-service-worker-private-did-network-subcheck',
+      'A03-service-worker-did-containment',
       'browser-did-proof-cleanup',
       'browser-private-did-runtime-cleanup',
     ],
     proof       : 'p0-browser-private-did-boundary',
     unsupported : [
       'A10-default-runtime-did-network',
-      'A03-service-worker-did-containment',
     ],
   },
   catalog: {

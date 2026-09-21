@@ -1,33 +1,34 @@
-import type { Page } from 'playwright';
 import type { PkarrFetch } from '../../pkarr-publication-adapter.js';
 import type { PrivatePkarrTestnetDependencies } from '../../runtime/private-pkarr-testnet.js';
+import type {
+  BrowserDidObservation,
+  BrowserDriver,
+  BrowserOrigin,
+  BrowserRequestObservation,
+  ForeignOriginObservation,
+  ServiceWorkerProbeObservation,
+  ServiceWorkerResolutionObservation,
+} from './did-browser-runtime.js';
 import type { LabCheck, LabProofReport } from '../../proof-result.js';
 
-import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
-
-import { chromium } from 'playwright';
 
 import { createProofReport } from '../../proof-result.js';
 import { findChromiumExecutable } from '../../runtime/chromium.js';
 import { PrivatePkarrTestnet } from '../../runtime/private-pkarr-testnet.js';
 import { startPkarrPublicationServer } from '../../pkarr-publication-server.js';
+import {
+  buildServiceWorkerBundle,
+  didsBrowserBundle,
+  launchBrowserDriver,
+  startBrowserOrigin,
+} from './did-browser-runtime.js';
 
-type BrowserDidObservation = {
-  didUri: string;
-  published: boolean;
-  resolvedDid: string;
-  resolvedDwnEndpoint: string;
-  secureContext: boolean;
-};
-
-type ForeignOriginObservation = {
-  putError: string;
-  putRejected: boolean;
-  subresourceRejected: boolean;
+type UpstreamRequestObservation = {
+  method: string;
+  url: string;
 };
 
 export type BrowserDidTransportProofOptions = {
@@ -40,27 +41,15 @@ export type PrivateBrowserDidProofOptions = Omit<BrowserDidTransportProofOptions
   testnet?: PrivatePkarrTestnetDependencies;
 };
 
-type BrowserOrigin = {
-  origin: string;
-  stop(): Promise<void>;
-};
-
-type BrowserDriver = {
-  allowedReadStatus(gatewayUri: string, didUri: string): Promise<number>;
-  attemptForeignRequests(origin: string, gatewayUri: string, didUri: string): Promise<ForeignOriginObservation>;
-  close(): Promise<void>;
-  publishAndResolve(origin: string, gatewayUri: string, advertisedDwnEndpoint: string): Promise<BrowserDidObservation>;
-  version(): string;
-};
-
 export type BrowserDidTransportDependencies = {
+  buildWorkerBundle(directory: string): Promise<string>;
   createDirectory(): Promise<string>;
   findExecutable(explicitPath?: string): string | undefined;
   launchDriver(executablePath: string): Promise<BrowserDriver>;
   removeDirectory(directory: string): Promise<void>;
   resolveBundle(): string;
   startAdapter: typeof startPkarrPublicationServer;
-  startOrigin(bundlePath: string): BrowserOrigin;
+  startOrigin(bundlePath: string, workerBundlePath: string): BrowserOrigin;
   upstreamFetch: PkarrFetch;
 };
 
@@ -73,130 +62,6 @@ export type PrivateBrowserDidProofDependencies = {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function didsBrowserBundle(): string {
-  const esmEntry = fileURLToPath(import.meta.resolve('@enbox/dids'));
-  return resolve(dirname(esmEntry), '../browser.mjs');
-}
-
-function startBrowserOrigin(bundlePath: string): BrowserOrigin {
-  const server = Bun.serve({
-    fetch(request): Response {
-      const pathname = new URL(request.url).pathname;
-      if (pathname === '/dids.mjs') {
-        return new Response(Bun.file(bundlePath), {
-          headers: {
-            'Cache-Control' : 'no-store',
-            'Content-Type'  : 'text/javascript; charset=utf-8',
-          },
-        });
-      }
-      if (pathname === '/') {
-        return new Response('<!doctype html><meta charset="utf-8"><title>Enbox DID browser proof</title>', {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
-        });
-      }
-      return new Response('not found', { status: 404 });
-    },
-    hostname : '127.0.0.1',
-    port     : 0,
-  });
-  return {
-    origin : `http://127.0.0.1:${server.port}`,
-    stop   : async (): Promise<void> => { await server.stop(true); },
-  };
-}
-
-async function publishAndResolve(page: Page, gatewayUri: string, advertisedDwnEndpoint: string): Promise<BrowserDidObservation> {
-  return page.evaluate(async ({ advertisedDwnEndpoint: endpoint, gatewayUri: gateway }) => {
-    const didsModulePath = '/dids.mjs';
-    const { DidDht } = await import(didsModulePath);
-    const did = await DidDht.create({
-      options: {
-        publish  : false,
-        services : [{ id: 'dwn', serviceEndpoint: endpoint, type: 'DecentralizedWebNode' }],
-      },
-    });
-    const publication = await DidDht.publish({
-      allowPrivateGatewayUri : true,
-      did,
-      gatewayUri             : gateway,
-    });
-    const resolution = await DidDht.resolve(did.uri, {
-      allowPrivateGatewayUri : true,
-      gatewayUri             : gateway,
-    });
-    const service = resolution.didDocument?.service?.find((entry: { type?: unknown }): boolean => entry.type === 'DecentralizedWebNode');
-    const serviceEndpoint = Array.isArray(service?.serviceEndpoint) ? service.serviceEndpoint[0] : service?.serviceEndpoint;
-    return {
-      didUri              : did.uri,
-      published           : publication.didDocumentMetadata.published === true,
-      resolvedDid         : resolution.didDocument?.id ?? '',
-      resolvedDwnEndpoint : typeof serviceEndpoint === 'string' ? serviceEndpoint : '',
-      secureContext       : window.isSecureContext,
-    };
-  }, { advertisedDwnEndpoint, gatewayUri });
-}
-
-async function attemptForeignRequests(page: Page, gatewayUri: string, didUri: string): Promise<ForeignOriginObservation> {
-  return page.evaluate(async ({ didUri: uri, gatewayUri: gateway }) => {
-    const identifier = uri.split(':').at(-1) ?? '';
-    let putError = '';
-    let putRejected = false;
-    try {
-      await fetch(new URL(identifier, gateway), {
-        body    : new Uint8Array(80),
-        headers : { 'Content-Type': 'application/octet-stream' },
-        method  : 'PUT',
-        mode    : 'cors',
-      });
-    } catch (error: unknown) {
-      putError = String(error);
-      putRejected = true;
-    }
-    const subresourceRejected = await new Promise<boolean>((resolve): void => {
-      const image = new Image();
-      image.addEventListener('error', (): void => { resolve(true); }, { once: true });
-      image.addEventListener('load', (): void => { resolve(false); }, { once: true });
-      image.src = new URL(`${identifier}?originless=1`, gateway).toString();
-    });
-    return { putError, putRejected, subresourceRejected };
-  }, { didUri, gatewayUri });
-}
-
-async function allowedReadStatus(page: Page, gatewayUri: string, didUri: string): Promise<number> {
-  return page.evaluate(async ({ didUri: uri, gatewayUri: gateway }) => {
-    const identifier = uri.split(':').at(-1) ?? '';
-    const response = await fetch(new URL(identifier, gateway), { mode: 'cors' });
-    await response.body?.cancel();
-    return response.status;
-  }, { didUri, gatewayUri });
-}
-
-async function launchBrowserDriver(executablePath: string): Promise<BrowserDriver> {
-  const browser = await chromium.launch({ executablePath, headless: true });
-  let allowedPage: Page | undefined;
-  return {
-    allowedReadStatus: async (gatewayUri, didUri): Promise<number> => {
-      if (allowedPage === undefined) {
-        throw new Error('Browser DID driver: publishAndResolve() must run before allowedReadStatus().');
-      }
-      return allowedReadStatus(allowedPage, gatewayUri, didUri);
-    },
-    attemptForeignRequests: async (origin, gatewayUri, didUri): Promise<ForeignOriginObservation> => {
-      const page = await browser.newPage();
-      await page.goto(origin, { waitUntil: 'domcontentloaded' });
-      return attemptForeignRequests(page, gatewayUri, didUri);
-    },
-    close             : async (): Promise<void> => { await browser.close(); },
-    publishAndResolve : async (origin, gatewayUri, advertisedDwnEndpoint): Promise<BrowserDidObservation> => {
-      allowedPage = await browser.newPage();
-      await allowedPage.goto(origin, { waitUntil: 'domcontentloaded' });
-      return publishAndResolve(allowedPage, gatewayUri, advertisedDwnEndpoint);
-    },
-    version: (): string => browser.version(),
-  };
 }
 
 function didObservationPassed(observation: BrowserDidObservation, advertisedDwnEndpoint: string): boolean {
@@ -217,15 +82,94 @@ function originObservationPassed(params: {
     params.upstreamRequestsAfter === params.upstreamRequestsBefore + 1 && params.allowedReadStatus === 200;
 }
 
+function observeUpstreamRequest(input: RequestInfo | URL, init?: RequestInit): UpstreamRequestObservation {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+  return { method: method.toUpperCase(), url: new URL(url).href };
+}
+
+function workerOwnedRequests(requests: readonly BrowserRequestObservation[]): BrowserRequestObservation[] {
+  return requests.filter((request): boolean => request.serviceWorkerOwned);
+}
+
+function serviceWorkerNetworkObservationPassed(params: {
+  didUri: string;
+  gatewayUri: string;
+  observation: ServiceWorkerResolutionObservation;
+  origin: string;
+  rejectionsAfter: number;
+  rejectionsBefore: number;
+  upstreamBaseUrl: string;
+  upstreamRequests: UpstreamRequestObservation[];
+}): boolean {
+  const identifier = params.didUri.split(':').at(-1) ?? '';
+  const expectedUpstreamUrl = new URL(identifier, params.upstreamBaseUrl).href;
+  const expectedGatewayUrl = new URL(identifier, params.gatewayUri).href;
+  const gatewayRequests = workerOwnedRequests(params.observation.browserRequests);
+  return params.observation.bootstrapLocked && params.observation.configured &&
+    params.observation.reconfigurationRejected && params.observation.resolutionError === '' &&
+    params.observation.resolvedDid === params.didUri &&
+    params.observation.scriptUrl === new URL('/did-service-worker.mjs', params.origin).href &&
+    gatewayRequests.length === 1 && gatewayRequests[0]?.method === 'GET' &&
+    gatewayRequests[0]?.serviceWorkerOwned === true && gatewayRequests[0]?.serviceWorkerUrl === params.observation.scriptUrl &&
+    gatewayRequests[0]?.url === expectedGatewayUrl &&
+    params.rejectionsAfter === params.rejectionsBefore && params.upstreamRequests.length === 1 &&
+    params.upstreamRequests[0]?.method === 'GET' && params.upstreamRequests[0]?.url === expectedUpstreamUrl;
+}
+
+function serviceWorkerContainmentObservationPassed(params: {
+  didUri: string;
+  foreign: ServiceWorkerResolutionObservation;
+  foreignOrigin: string;
+  foreignRejectionsAfter: number;
+  foreignRejectionsBefore: number;
+  foreignUpstreamRequests: UpstreamRequestObservation[];
+  gatewayUri: string;
+  origin: string;
+  probe: ServiceWorkerProbeObservation;
+  probeRejectionsAfter: number;
+  probeRejectionsBefore: number;
+  probeUpstreamRequests: UpstreamRequestObservation[];
+  sibling: ServiceWorkerProbeObservation;
+  siblingRejectionsAfter: number;
+  siblingRejectionsBefore: number;
+  siblingUpstreamRequests: UpstreamRequestObservation[];
+}): boolean {
+  const identifier = params.didUri.split(':').at(-1) ?? '';
+  const expectedGatewayUrl = new URL(identifier, params.gatewayUri).href;
+  const probeGatewayRequests = workerOwnedRequests(params.probe.browserRequests);
+  const siblingGatewayRequests = workerOwnedRequests(params.sibling.browserRequests);
+  const foreignGatewayRequests = workerOwnedRequests(params.foreign.browserRequests);
+  return params.probe.actorSubstitutionRejected && params.probe.bootstrapLocked &&
+    params.probe.malformedCommandRejected && params.probe.oversizedCommandRejected &&
+    params.probe.unconfiguredError === 'worker-unconfigured' &&
+    params.probe.scriptUrl === new URL('/did-service-worker.mjs', params.origin).href &&
+    probeGatewayRequests.length === 0 && params.probeRejectionsAfter === params.probeRejectionsBefore &&
+    params.probeUpstreamRequests.length === 0 &&
+    params.sibling.bootstrapLocked && params.sibling.unconfiguredError === 'worker-unconfigured' &&
+    params.sibling.scriptUrl === new URL('/did-service-worker.mjs', params.origin).href &&
+    siblingGatewayRequests.length === 0 && params.siblingRejectionsAfter === params.siblingRejectionsBefore &&
+    params.siblingUpstreamRequests.length === 0 &&
+    params.foreign.bootstrapLocked && params.foreign.configured && params.foreign.reconfigurationRejected &&
+    params.foreign.resolutionError === 'resolution-failed' && params.foreign.resolvedDid === '' &&
+    params.foreign.scriptUrl === new URL('/did-service-worker.mjs', params.foreignOrigin).href &&
+    foreignGatewayRequests.length === 1 && foreignGatewayRequests[0]?.method === 'GET' &&
+    foreignGatewayRequests[0]?.serviceWorkerOwned === true &&
+    foreignGatewayRequests[0]?.serviceWorkerUrl === params.foreign.scriptUrl &&
+    foreignGatewayRequests[0]?.url === expectedGatewayUrl &&
+    params.foreignRejectionsAfter === params.foreignRejectionsBefore + 1 && params.foreignUpstreamRequests.length === 0;
+}
+
 const defaultBrowserDidTransportDependencies: BrowserDidTransportDependencies = {
-  createDirectory : (): Promise<string> => mkdtemp(join(tmpdir(), 'enbox-lab-browser-did-')),
-  findExecutable  : findChromiumExecutable,
-  launchDriver    : launchBrowserDriver,
-  removeDirectory : async (directory): Promise<void> => { await rm(directory, { force: true, recursive: true }); },
-  resolveBundle   : didsBrowserBundle,
-  startAdapter    : startPkarrPublicationServer,
-  startOrigin     : startBrowserOrigin,
-  upstreamFetch   : fetch,
+  buildWorkerBundle : buildServiceWorkerBundle,
+  createDirectory   : (): Promise<string> => mkdtemp(join(tmpdir(), 'enbox-lab-browser-did-')),
+  findExecutable    : findChromiumExecutable,
+  launchDriver      : launchBrowserDriver,
+  removeDirectory   : async (directory): Promise<void> => { await rm(directory, { force: true, recursive: true }); },
+  resolveBundle     : didsBrowserBundle,
+  startAdapter      : startPkarrPublicationServer,
+  startOrigin       : startBrowserOrigin,
+  upstreamFetch     : fetch,
 };
 
 /** Proves real browser did:dht publication and resolution through one caller-supplied transport. */
@@ -257,25 +201,30 @@ async function runBrowserDidTransportProof(
   let adapter: Awaited<ReturnType<typeof startPkarrPublicationServer>> | undefined;
   let driver: BrowserDriver | undefined;
   let upstreamRequests = 0;
+  const upstreamRequestObservations: UpstreamRequestObservation[] = [];
   const countedFetch: PkarrFetch = async (input, init): Promise<Response> => {
     upstreamRequests += 1;
+    upstreamRequestObservations.push(observeUpstreamRequest(input, init));
     return await dependencies.upstreamFetch(input, init);
   };
 
   try {
     directory = await dependencies.createDirectory();
     const bundle = dependencies.resolveBundle();
-    app = dependencies.startOrigin(bundle);
-    foreignApp = dependencies.startOrigin(bundle);
+    const workerBundle = await dependencies.buildWorkerBundle(directory);
+    app = dependencies.startOrigin(bundle, workerBundle);
+    foreignApp = dependencies.startOrigin(bundle, workerBundle);
     adapter = await dependencies.startAdapter({
       allowedOrigins  : [app.origin],
       fetch           : countedFetch,
       journalLocation : join(directory, 'accepted-publications.sqlite'),
       upstreamBaseUrl : options.upstreamBaseUrl,
     });
+    app.configureGateway(adapter.endpoint);
+    foreignApp.configureGateway(adapter.endpoint);
     driver = await dependencies.launchDriver(executablePath);
     const advertisedDwnEndpoint = 'http://localhost:41000';
-    const observation = await driver.publishAndResolve(app.origin, adapter.endpoint, advertisedDwnEndpoint);
+    const observation = await driver.publishAndResolve(app.origin, advertisedDwnEndpoint);
     const didPassed = didObservationPassed(observation, advertisedDwnEndpoint);
     checks.push({
       details: {
@@ -297,10 +246,10 @@ async function runBrowserDidTransportProof(
 
     const requestsBeforeForeignRead = upstreamRequests;
     const rejectionsBefore = adapter.browserRejectionCount();
-    const foreign = await driver.attemptForeignRequests(foreignApp.origin, adapter.endpoint, observation.didUri);
+    const foreign = await driver.attemptForeignRequests(foreignApp.origin, observation.didUri);
     const rejectionsAfter = adapter.browserRejectionCount();
     const foreignReachedUpstream = upstreamRequests !== requestsBeforeForeignRead;
-    const allowedRead = await driver.allowedReadStatus(adapter.endpoint, observation.didUri);
+    const allowedRead = await driver.allowedReadStatus(observation.didUri);
     const originPassed = !foreignReachedUpstream && originObservationPassed({
       allowedReadStatus      : allowedRead,
       foreign,
@@ -327,6 +276,123 @@ async function runBrowserDidTransportProof(
       summary : originPassed
         ? 'The private DID gateway rejected a foreign browser origin before upstream access'
         : 'A foreign browser origin reached or read from the private DID gateway',
+    });
+
+    const probeUpstreamIndex = upstreamRequestObservations.length;
+    const probeRejectionsBefore = adapter.browserRejectionCount();
+    const workerProbe = await driver.probeServiceWorker(app.origin, observation.didUri);
+    const probeRejectionsAfter = adapter.browserRejectionCount();
+    const probeUpstreamRequests = upstreamRequestObservations.slice(probeUpstreamIndex);
+
+    const workerUpstreamIndex = upstreamRequestObservations.length;
+    const workerRejectionsBefore = adapter.browserRejectionCount();
+    const worker = await driver.resolveFromServiceWorker(app.origin, observation.didUri);
+    const workerRejectionsAfter = adapter.browserRejectionCount();
+    const workerUpstreamRequests = upstreamRequestObservations.slice(workerUpstreamIndex);
+    const workerNetworkPassed = serviceWorkerNetworkObservationPassed({
+      didUri           : observation.didUri,
+      gatewayUri       : adapter.endpoint,
+      observation      : worker,
+      origin           : app.origin,
+      rejectionsAfter  : workerRejectionsAfter,
+      rejectionsBefore : workerRejectionsBefore,
+      upstreamBaseUrl  : options.upstreamBaseUrl,
+      upstreamRequests : workerUpstreamRequests,
+    });
+    const workerRequest = workerUpstreamRequests[0];
+    const workerBrowserRequest = workerOwnedRequests(worker.browserRequests)[0];
+    checks.push({
+      details: {
+        actorOrigin                : app.origin,
+        bootstrapLocked            : worker.bootstrapLocked,
+        configured                 : worker.configured,
+        reconfigurationRejected    : worker.reconfigurationRejected,
+        resolvedDid                : worker.resolvedDid,
+        workerScriptPath           : new URL(worker.scriptUrl).pathname,
+        upstreamRequestsAfter      : upstreamRequestObservations.length,
+        upstreamRequestsBefore     : workerUpstreamIndex,
+        workerLookupMethod         : workerRequest?.method ?? '',
+        workerLookupPath           : workerRequest === undefined ? '' : new URL(workerRequest.url).pathname,
+        workerRequestMethod        : workerBrowserRequest?.method ?? '',
+        workerRequestPath          : workerBrowserRequest === undefined ? '' : new URL(workerBrowserRequest.url).pathname,
+        workerRequestServiceWorker : workerBrowserRequest?.serviceWorkerOwned ?? false,
+        workerRequestWorkerPath    : workerBrowserRequest?.serviceWorkerUrl === undefined ||
+          workerBrowserRequest.serviceWorkerUrl === '' ? '' : new URL(workerBrowserRequest.serviceWorkerUrl).pathname,
+        workerRejectionsAfter,
+        workerRejectionsBefore,
+      },
+      id      : 'A10-service-worker-private-did-network-subcheck',
+      status  : workerNetworkPassed ? 'pass' : 'fail',
+      summary : workerNetworkPassed
+        ? 'The source-bound service worker used its immutable actor bootstrap for one exact private DID lookup'
+        : 'The service worker did not prove one exact lookup from its immutable actor bootstrap',
+    });
+
+    const siblingUpstreamIndex = upstreamRequestObservations.length;
+    const siblingRejectionsBefore = adapter.browserRejectionCount();
+    const siblingWorkerProbe = await driver.probeSiblingServiceWorker(app.origin, observation.didUri);
+    const siblingRejectionsAfter = adapter.browserRejectionCount();
+    const siblingUpstreamRequests = upstreamRequestObservations.slice(siblingUpstreamIndex);
+
+    const foreignWorkerUpstreamIndex = upstreamRequestObservations.length;
+    const foreignWorkerRejectionsBefore = adapter.browserRejectionCount();
+    const foreignWorker = await driver.attemptForeignServiceWorker(foreignApp.origin, observation.didUri);
+    const foreignWorkerRejectionsAfter = adapter.browserRejectionCount();
+    const foreignWorkerUpstreamRequests = upstreamRequestObservations.slice(foreignWorkerUpstreamIndex);
+    const workerContainmentPassed = serviceWorkerContainmentObservationPassed({
+      didUri                  : observation.didUri,
+      foreign                 : foreignWorker,
+      foreignOrigin           : foreignApp.origin,
+      foreignRejectionsAfter  : foreignWorkerRejectionsAfter,
+      foreignRejectionsBefore : foreignWorkerRejectionsBefore,
+      foreignUpstreamRequests : foreignWorkerUpstreamRequests,
+      gatewayUri              : adapter.endpoint,
+      origin                  : app.origin,
+      probe                   : workerProbe,
+      probeRejectionsAfter,
+      probeRejectionsBefore,
+      probeUpstreamRequests,
+      sibling                 : siblingWorkerProbe,
+      siblingRejectionsAfter,
+      siblingRejectionsBefore,
+      siblingUpstreamRequests,
+    });
+    const foreignWorkerRequest = workerOwnedRequests(foreignWorker.browserRequests)[0];
+    checks.push({
+      details: {
+        actorSubstitutionRejected  : workerProbe.actorSubstitutionRejected,
+        foreignBootstrapLocked     : foreignWorker.bootstrapLocked,
+        foreignConfigured          : foreignWorker.configured,
+        foreignError               : foreignWorker.resolutionError,
+        foreignOrigin              : foreignApp.origin,
+        foreignRejectionsAfter     : foreignWorkerRejectionsAfter,
+        foreignRejectionsBefore    : foreignWorkerRejectionsBefore,
+        foreignUpstreamAfter       : upstreamRequestObservations.length,
+        foreignUpstreamBefore      : foreignWorkerUpstreamIndex,
+        foreignWorkerScriptPath    : new URL(foreignWorker.scriptUrl).pathname,
+        foreignWorkerRequestMethod : foreignWorkerRequest?.method ?? '',
+        foreignWorkerRequestPath   : foreignWorkerRequest === undefined ? '' : new URL(foreignWorkerRequest.url).pathname,
+        foreignWorkerRequestOwner  : foreignWorkerRequest?.serviceWorkerOwned ?? false,
+        foreignWorkerRequestWorker : foreignWorkerRequest?.serviceWorkerUrl === undefined ||
+          foreignWorkerRequest.serviceWorkerUrl === '' ? '' : new URL(foreignWorkerRequest.serviceWorkerUrl).pathname,
+        malformedCommandRejected : workerProbe.malformedCommandRejected,
+        oversizedCommandRejected : workerProbe.oversizedCommandRejected,
+        probeRejectionsAfter,
+        probeRejectionsBefore,
+        probeUpstreamAfter       : probeUpstreamIndex + probeUpstreamRequests.length,
+        probeUpstreamBefore      : probeUpstreamIndex,
+        siblingRejectionsAfter,
+        siblingRejectionsBefore,
+        siblingUnconfiguredError : siblingWorkerProbe.unconfiguredError,
+        siblingUpstreamAfter     : siblingUpstreamIndex + siblingUpstreamRequests.length,
+        siblingUpstreamBefore    : siblingUpstreamIndex,
+        unconfiguredError        : workerProbe.unconfiguredError,
+      },
+      id      : 'A03-service-worker-did-containment',
+      status  : workerContainmentPassed ? 'pass' : 'fail',
+      summary : workerContainmentPassed
+        ? 'Malformed, substituted, unconfigured sibling, and foreign service-worker traffic stayed upstream-isolated'
+        : 'One or more denied service-worker DID paths reached the gateway upstream or did not fail closed',
     });
   } catch (error: unknown) {
     checks.push({
@@ -442,12 +508,7 @@ async function runPrivateBrowserDidProofWithDependencies(
     checks.push({
       id      : 'A10-default-runtime-did-network',
       status  : 'unsupported',
-      summary : 'Default agent, auth, API, and service-worker DID network propagation requires the released Enbox #1726 package cohort',
-    });
-    checks.push({
-      id      : 'A03-service-worker-did-containment',
-      status  : 'unsupported',
-      summary : 'Service-worker DID traffic containment remains part of the full browser actor E2E',
+      summary : 'Default agent, auth, and API DID network propagation requires the released Enbox #1726 package cohort',
     });
   } catch (error: unknown) {
     const logs = await testnet.logs();
@@ -491,4 +552,6 @@ export const browserDidProofInternals = {
   originObservationPassed,
   runBrowserDidTransportProof,
   runPrivateBrowserDidProofWithDependencies,
+  serviceWorkerContainmentObservationPassed,
+  serviceWorkerNetworkObservationPassed,
 };

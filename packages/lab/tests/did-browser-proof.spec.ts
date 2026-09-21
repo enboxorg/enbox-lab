@@ -12,7 +12,11 @@ import type {
 import { describe, expect, it } from 'bun:test';
 
 import { createProofReport } from '../src/proof-result.js';
+import { parseDidServiceWorkerRequest } from '../src/proofs/did-browser/fixture/did-service-worker-protocol.js';
 import { browserDidProofInternals, runPrivateBrowserDidProof } from '../src/proofs/did-browser/did-browser-proof.js';
+
+const TEST_DID_IDENTIFIER = 'y'.repeat(52);
+const TEST_DID_URI = `did:dht:${TEST_DID_IDENTIFIER}`;
 
 type TransportHarnessOptions = {
   allowedReadStatus?: number;
@@ -26,6 +30,59 @@ type TransportHarnessOptions = {
   resolvedDwnEndpoint?: string;
   secureContext?: boolean;
   subresourceRejected?: boolean;
+  workerActorSubstitutionRejected?: boolean;
+  workerAllowedResolvedDid?: string;
+  workerBootstrapLocked?: boolean;
+  workerConfigured?: boolean;
+  workerForeignBootstrapLocked?: boolean;
+  workerForeignConfigured?: boolean;
+  workerForeignError?: string;
+  workerForeignReconfigurationRejected?: boolean;
+  workerForeignRejectionIncrement?: number;
+  workerForeignPublicFallbackRequest?: boolean;
+  workerForeignRequestServiceWorkerOwned?: boolean;
+  workerForeignRequestWorkerUrl?: string;
+  workerForeignUpstreamRequests?: number;
+  workerMalformedCommandRejected?: boolean;
+  workerNetworkRejectionIncrement?: number;
+  workerOversizedCommandRejected?: boolean;
+  workerProbeRejectionIncrement?: number;
+  workerProbeGatewayRequests?: number;
+  workerProbeBootstrapLocked?: boolean;
+  workerProbePublicFallbackRequest?: boolean;
+  workerProbeUpstreamRequests?: number;
+  workerReconfigurationRejected?: boolean;
+  workerPublicFallbackRequest?: boolean;
+  workerRequestServiceWorkerOwned?: boolean;
+  workerRequestWorkerUrl?: string;
+  workerSiblingBootstrapLocked?: boolean;
+  workerSiblingGatewayRequests?: number;
+  workerSiblingPublicFallbackRequest?: boolean;
+  workerSiblingRejectionIncrement?: number;
+  workerSiblingUnconfiguredError?: string;
+  workerSiblingUpstreamRequests?: number;
+  workerUnconfiguredError?: string;
+  workerUpstreamRequests?: number;
+};
+
+type WorkerProbe = {
+  actorSubstitutionRejected: boolean;
+  bootstrapLocked: boolean;
+  browserRequests: Array<{ method: string; serviceWorkerOwned: boolean; serviceWorkerUrl: string; url: string }>;
+  malformedCommandRejected: boolean;
+  oversizedCommandRejected: boolean;
+  scriptUrl: string;
+  unconfiguredError: string;
+};
+
+type WorkerResolution = {
+  bootstrapLocked: boolean;
+  browserRequests: Array<{ method: string; serviceWorkerOwned: boolean; serviceWorkerUrl: string; url: string }>;
+  configured: boolean;
+  reconfigurationRejected: boolean;
+  resolutionError: string;
+  resolvedDid: string;
+  scriptUrl: string;
 };
 
 function transportHarness(options: TransportHarnessOptions = {}): {
@@ -43,16 +100,23 @@ function transportHarness(options: TransportHarnessOptions = {}): {
       throw new Error(`${name} cleanup failed`);
     }
   };
-  const callUpstream = async (): Promise<void> => {
+  const callUpstream = async (url = 'http://upstream.invalid/key'): Promise<void> => {
     if (adapterFetch === undefined) {
       throw new Error('adapter fetch was not installed');
     }
-    await adapterFetch('http://upstream.invalid/key');
+    await adapterFetch(url);
   };
+  const browserRequest = (url: string, serviceWorkerUrl: string, serviceWorkerOwned = true): {
+    method: string;
+    serviceWorkerOwned: boolean;
+    serviceWorkerUrl: string;
+    url: string;
+  } => ({ method: 'GET', serviceWorkerOwned, serviceWorkerUrl: serviceWorkerOwned ? serviceWorkerUrl : '', url });
   const dependencies: BrowserDidTransportDependencies = {
-    createDirectory : async (): Promise<string> => '/tmp/browser-proof-test',
-    findExecutable  : (): string => '/test/chromium',
-    launchDriver    : async () => {
+    buildWorkerBundle : async (): Promise<string> => '/test/did-service-worker.js',
+    createDirectory   : async (): Promise<string> => '/tmp/browser-proof-test',
+    findExecutable    : (): string => '/test/chromium',
+    launchDriver      : async () => {
       if (options.launchError !== undefined) {
         throw new Error(options.launchError);
       }
@@ -60,6 +124,32 @@ function transportHarness(options: TransportHarnessOptions = {}): {
         allowedReadStatus: async (): Promise<number> => {
           await callUpstream();
           return options.allowedReadStatus ?? 200;
+        },
+        attemptForeignServiceWorker: async (origin, didUri): Promise<WorkerResolution> => {
+          for (let index = 0; index < (options.workerForeignUpstreamRequests ?? 0); index += 1) {
+            await callUpstream(`http://127.0.0.1:41004/${didUri.split(':').at(-1) ?? ''}`);
+          }
+          rejections += options.workerForeignRejectionIncrement ?? 1;
+          return {
+            bootstrapLocked : options.workerForeignBootstrapLocked ?? true,
+            browserRequests : [
+              browserRequest(
+                `http://127.0.0.1:41003/${didUri.split(':').at(-1) ?? ''}`,
+                options.workerForeignRequestWorkerUrl ?? `${origin}/did-service-worker.mjs`,
+                options.workerForeignRequestServiceWorkerOwned ?? true,
+              ),
+              ...(options.workerForeignPublicFallbackRequest === true
+                ? [browserRequest(
+                  `https://diddht.tbddev.org/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )] : []),
+            ],
+            configured              : options.workerForeignConfigured ?? true,
+            reconfigurationRejected : options.workerForeignReconfigurationRejected ?? true,
+            resolutionError         : options.workerForeignError ?? 'resolution-failed',
+            resolvedDid             : '',
+            scriptUrl               : `${origin}/did-service-worker.mjs`,
+          };
         },
         attemptForeignRequests: async (): Promise<{
           putError: string;
@@ -76,8 +166,62 @@ function transportHarness(options: TransportHarnessOptions = {}): {
             subresourceRejected : options.subresourceRejected ?? true,
           };
         },
-        close             : async (): Promise<void> => { await cleanup('driver'); },
-        publishAndResolve : async (): Promise<{
+        close              : async (): Promise<void> => { await cleanup('driver'); },
+        probeServiceWorker : async (origin): Promise<WorkerProbe> => {
+          for (let index = 0; index < (options.workerProbeUpstreamRequests ?? 0); index += 1) {
+            await callUpstream();
+          }
+          rejections += options.workerProbeRejectionIncrement ?? 0;
+          return {
+            actorSubstitutionRejected : options.workerActorSubstitutionRejected ?? true,
+            bootstrapLocked           : options.workerProbeBootstrapLocked ?? true,
+            browserRequests           : [
+              ...Array.from({ length: options.workerProbeGatewayRequests ?? 0 }, () => (
+                browserRequest(
+                  `http://127.0.0.1:41003/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )
+              )),
+              ...(options.workerProbePublicFallbackRequest === true
+                ? [browserRequest(
+                  `https://diddht.tbddev.org/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )] : []),
+            ],
+            malformedCommandRejected : options.workerMalformedCommandRejected ?? true,
+            oversizedCommandRejected : options.workerOversizedCommandRejected ?? true,
+            scriptUrl                : `${origin}/did-service-worker.mjs`,
+            unconfiguredError        : options.workerUnconfiguredError ?? 'worker-unconfigured',
+          };
+        },
+        probeSiblingServiceWorker: async (origin): Promise<WorkerProbe> => {
+          for (let index = 0; index < (options.workerSiblingUpstreamRequests ?? 0); index += 1) {
+            await callUpstream();
+          }
+          rejections += options.workerSiblingRejectionIncrement ?? 0;
+          return {
+            actorSubstitutionRejected : true,
+            bootstrapLocked           : options.workerSiblingBootstrapLocked ?? true,
+            browserRequests           : [
+              ...Array.from({ length: options.workerSiblingGatewayRequests ?? 0 }, () => (
+                browserRequest(
+                  `http://127.0.0.1:41003/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )
+              )),
+              ...(options.workerSiblingPublicFallbackRequest === true
+                ? [browserRequest(
+                  `https://diddht.tbddev.org/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )] : []),
+            ],
+            malformedCommandRejected : true,
+            oversizedCommandRejected : true,
+            scriptUrl                : `${origin}/did-service-worker.mjs`,
+            unconfiguredError        : options.workerSiblingUnconfiguredError ?? 'worker-unconfigured',
+          };
+        },
+        publishAndResolve: async (): Promise<{
           didUri: string;
           published: boolean;
           resolvedDid: string;
@@ -86,11 +230,37 @@ function transportHarness(options: TransportHarnessOptions = {}): {
         }> => {
           await callUpstream();
           return {
-            didUri              : 'did:dht:test',
+            didUri              : TEST_DID_URI,
             published           : options.published ?? true,
-            resolvedDid         : options.resolvedDid ?? 'did:dht:test',
+            resolvedDid         : options.resolvedDid ?? TEST_DID_URI,
             resolvedDwnEndpoint : options.resolvedDwnEndpoint ?? 'http://localhost:41000',
             secureContext       : options.secureContext ?? true,
+          };
+        },
+        resolveFromServiceWorker: async (origin, didUri): Promise<WorkerResolution> => {
+          for (let index = 0; index < (options.workerUpstreamRequests ?? 1); index += 1) {
+            await callUpstream(`http://127.0.0.1:41004/${didUri.split(':').at(-1) ?? ''}`);
+          }
+          rejections += options.workerNetworkRejectionIncrement ?? 0;
+          return {
+            bootstrapLocked : options.workerBootstrapLocked ?? true,
+            browserRequests : [
+              browserRequest(
+                `http://127.0.0.1:41003/${didUri.split(':').at(-1) ?? ''}`,
+                options.workerRequestWorkerUrl ?? `${origin}/did-service-worker.mjs`,
+                options.workerRequestServiceWorkerOwned ?? true,
+              ),
+              ...(options.workerPublicFallbackRequest === true
+                ? [browserRequest(
+                  `https://diddht.tbddev.org/${TEST_DID_IDENTIFIER}`,
+                  `${origin}/did-service-worker.mjs`,
+                )] : []),
+            ],
+            configured              : options.workerConfigured ?? true,
+            reconfigurationRejected : options.workerReconfigurationRejected ?? true,
+            resolutionError         : '',
+            resolvedDid             : options.workerAllowedResolvedDid ?? didUri,
+            scriptUrl               : `${origin}/did-service-worker.mjs`,
           };
         },
         version: (): string => 'test-browser',
@@ -109,10 +279,20 @@ function transportHarness(options: TransportHarnessOptions = {}): {
         stop                  : async (): Promise<void> => { await cleanup('adapter'); },
       };
     },
-    startOrigin: (): { origin: string; stop(): Promise<void> } => {
+    startOrigin: (): { configureGateway(gatewayUri: string): void; origin: string; stop(): Promise<void> } => {
       const origin = origins[originIndex++]!;
       const name = originIndex === 1 ? 'allowed-origin' : 'foreign-origin';
-      return { origin, stop: async (): Promise<void> => { await cleanup(name); } };
+      let gateway: string | undefined;
+      return {
+        configureGateway: (gatewayUri): void => {
+          if (gateway !== undefined && gateway !== gatewayUri) {
+            throw new Error('gateway changed');
+          }
+          gateway = gatewayUri;
+        },
+        origin,
+        stop: async (): Promise<void> => { await cleanup(name); },
+      };
     },
     upstreamFetch: async (): Promise<Response> => new Response(undefined, { status: 200 }),
   };
@@ -177,11 +357,23 @@ function privateProofDependencies(params: {
     runTransport: async (options): Promise<LabProofReport> => {
       params.onRunTransport?.();
       return createProofReport({
-        checks: [{
-          id      : 'transport-check',
-          status  : 'pass',
-          summary : `used ${options.upstreamBaseUrl}`,
-        }],
+        checks: [
+          {
+            id      : 'transport-check',
+            status  : 'pass',
+            summary : `used ${options.upstreamBaseUrl}`,
+          },
+          {
+            id      : 'A03-service-worker-did-containment',
+            status  : 'pass',
+            summary : 'worker contained',
+          },
+          {
+            id      : 'A10-service-worker-private-did-network-subcheck',
+            status  : 'pass',
+            summary : 'worker resolved',
+          },
+        ],
         finishedAt : new Date('2026-09-20T12:00:00.000Z'),
         proof      : 'p0-browser-did-transport',
         startedAt  : new Date('2026-09-20T12:00:00.000Z'),
@@ -220,6 +412,38 @@ describe('Browser private DID proof verdicts', () => {
         id      : 'A03-browser-did-origin-allowlist-subcheck',
         status  : 'pass',
       }),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          bootstrapLocked            : true,
+          configured                 : true,
+          reconfigurationRejected    : true,
+          upstreamRequestsAfter      : 3,
+          upstreamRequestsBefore     : 2,
+          workerLookupMethod         : 'GET',
+          workerLookupPath           : `/${TEST_DID_IDENTIFIER}`,
+          workerRejectionsAfter      : 2,
+          workerRejectionsBefore     : 2,
+          workerRequestMethod        : 'GET',
+          workerRequestServiceWorker : true,
+        }),
+        id     : 'A10-service-worker-private-did-network-subcheck',
+        status : 'pass',
+      }),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          actorSubstitutionRejected : true,
+          foreignRejectionsAfter    : 3,
+          foreignRejectionsBefore   : 2,
+          foreignUpstreamAfter      : 3,
+          foreignUpstreamBefore     : 3,
+          malformedCommandRejected  : true,
+          oversizedCommandRejected  : true,
+          probeRejectionsAfter      : 2,
+          probeRejectionsBefore     : 2,
+        }),
+        id     : 'A03-service-worker-did-containment',
+        status : 'pass',
+      }),
       expect.objectContaining({ id: 'browser-did-proof-cleanup', status: 'pass' }),
     ]);
     expect(harness.cleanupCalls).toEqual(['driver', 'adapter', 'allowed-origin', 'foreign-origin', 'directory']);
@@ -239,18 +463,116 @@ describe('Browser private DID proof verdicts', () => {
     expect(report.status).toBe('fail');
   });
 
+  it('should independently fail the service-worker network verdict on incomplete positive evidence', async () => {
+    for (const options of [
+      { workerUpstreamRequests: 2 },
+      { workerNetworkRejectionIncrement: 1 },
+      { workerBootstrapLocked: false },
+      { workerConfigured: false },
+      { workerAllowedResolvedDid: '' },
+      { workerReconfigurationRejected: false },
+      { workerPublicFallbackRequest: true },
+      { workerRequestServiceWorkerOwned: false },
+      { workerRequestWorkerUrl: 'http://127.0.0.1:41001/other-worker.mjs' },
+    ]) {
+      const harness = transportHarness(options);
+      const report = await browserDidProofInternals.runBrowserDidTransportProof({
+        upstreamBaseUrl: 'http://127.0.0.1:41004/',
+      }, harness.dependencies);
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id     : 'A10-service-worker-private-did-network-subcheck',
+        status : 'fail',
+      }));
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id     : 'A03-service-worker-did-containment',
+        status : 'pass',
+      }));
+      expect(report.status).toBe('fail');
+    }
+  });
+
+  it('should independently fail worker containment on incomplete denial evidence', async () => {
+    for (const options of [
+      { workerActorSubstitutionRejected: false },
+      { workerForeignError: '' },
+      { workerForeignPublicFallbackRequest: true },
+      { workerForeignRejectionIncrement: 0 },
+      { workerForeignRequestServiceWorkerOwned: false },
+      { workerForeignRequestWorkerUrl: 'http://127.0.0.1:41002/other-worker.mjs' },
+      { workerForeignUpstreamRequests: 1 },
+      { workerMalformedCommandRejected: false },
+      { workerOversizedCommandRejected: false },
+      { workerProbeGatewayRequests: 1 },
+      { workerProbeBootstrapLocked: false },
+      { workerProbePublicFallbackRequest: true },
+      { workerProbeRejectionIncrement: 1 },
+      { workerProbeUpstreamRequests: 1 },
+      { workerSiblingBootstrapLocked: false },
+      { workerSiblingGatewayRequests: 1 },
+      { workerSiblingPublicFallbackRequest: true },
+      { workerSiblingRejectionIncrement: 1 },
+      { workerSiblingUnconfiguredError: '' },
+      { workerSiblingUpstreamRequests: 1 },
+      { workerUnconfiguredError: '' },
+    ]) {
+      const harness = transportHarness(options);
+      const report = await browserDidProofInternals.runBrowserDidTransportProof({
+        upstreamBaseUrl: 'http://127.0.0.1:41004/',
+      }, harness.dependencies);
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id     : 'A03-service-worker-did-containment',
+        status : 'fail',
+      }));
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id     : 'A10-service-worker-private-did-network-subcheck',
+        status : 'pass',
+      }));
+      expect(report.status).toBe('fail');
+    }
+  });
+
+  it('should accept only exact bounded service-worker commands', () => {
+    const id = '12345678-1234-1234-1234-123456789abc';
+    const configure = {
+      actorOrigin : 'http://127.0.0.1:41001',
+      gatewayUri  : 'http://127.0.0.1:41003/',
+      id,
+      kind        : 'configure',
+    } as const;
+    const resolve = { didUri: TEST_DID_URI, id, kind: 'resolve' } as const;
+    expect(parseDidServiceWorkerRequest(configure)).toEqual(configure);
+    expect(parseDidServiceWorkerRequest(resolve)).toEqual(resolve);
+
+    for (const invalid of [
+      { ...configure, extra: true },
+      { ...configure, actorOrigin: 'not-an-origin' },
+      { ...configure, actorOrigin: 'http://127.0.0.1:41001/path' },
+      { ...configure, actorOrigin: `http://127.0.0.1/${'x'.repeat(257)}` },
+      { ...configure, gatewayUri: 'not-a-gateway' },
+      { ...configure, gatewayUri: `http://127.0.0.1/${'x'.repeat(2_049)}/` },
+      { ...configure, gatewayUri: 'http://user@127.0.0.1:41003/' },
+      { ...configure, id: 'not-a-request-id' },
+      { ...resolve, didUri: 'did:dht:not-valid' },
+      { ...resolve, extra: true },
+      { id, kind: 'unsupported' },
+      null,
+    ]) {
+      expect(parseDidServiceWorkerRequest(invalid)).toBeUndefined();
+    }
+  });
+
   it('should reject every incomplete DID and origin observation', () => {
     const didObservation = {
-      didUri              : 'did:dht:test',
+      didUri              : TEST_DID_URI,
       published           : true,
-      resolvedDid         : 'did:dht:test',
+      resolvedDid         : TEST_DID_URI,
       resolvedDwnEndpoint : 'http://localhost:41000',
       secureContext       : true,
     };
     expect(browserDidProofInternals.didObservationPassed(didObservation, 'http://localhost:41000')).toBe(true);
     for (const changed of [
       { published: false },
-      { resolvedDid: 'did:dht:other' },
+      { resolvedDid: `did:dht:${'o'.repeat(52)}` },
       { resolvedDwnEndpoint: 'http://localhost:42000' },
       { secureContext: false },
     ]) {
@@ -297,7 +619,7 @@ describe('Browser private DID proof verdicts', () => {
     expect(cleanupHarness.cleanupCalls).toEqual(['driver', 'adapter', 'allowed-origin', 'foreign-origin', 'directory']);
   });
 
-  it('should compose the owned boundary and keep every unfinished runtime path explicit', async () => {
+  it('should compose the owned boundary and keep the unfinished default-runtime path explicit', async () => {
     const report = await browserDidProofInternals.runPrivateBrowserDidProofWithDependencies(
       { now: (): Date => new Date('2026-09-20T12:00:00.000Z') },
       privateProofDependencies(),
@@ -308,7 +630,8 @@ describe('Browser private DID proof verdicts', () => {
       expect.objectContaining({ id: 'A06-browser-private-testnet', status: 'pass' }),
       expect.objectContaining({ id: 'transport-check', status: 'pass' }),
       expect.objectContaining({ id: 'A10-default-runtime-did-network', status: 'unsupported' }),
-      expect.objectContaining({ id: 'A03-service-worker-did-containment', status: 'unsupported' }),
+      expect.objectContaining({ id: 'A03-service-worker-did-containment', status: 'pass' }),
+      expect.objectContaining({ id: 'A10-service-worker-private-did-network-subcheck', status: 'pass' }),
       expect.objectContaining({ id: 'browser-private-did-runtime-cleanup', status: 'pass' }),
     ]));
   });

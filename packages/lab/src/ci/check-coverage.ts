@@ -45,20 +45,22 @@ export function assertFileCoverage(summary: CoverageSummary, minimums: Readonly<
 }
 
 export const criticalCoverageFloors = {
-  'src/pkarr-publication-adapter.ts'                    : 95,
-  'src/pkarr-publication-journal.ts'                    : 95,
-  'src/pkarr-publication-server.ts'                     : 90,
-  'src/proof-result.ts'                                 : 95,
-  'src/proofs/connect/connect-browser-proof.ts'         : 95,
-  'src/proofs/connect/connect-relay-runtime.ts'         : 95,
-  'src/proofs/connect/connect-worker-boundary.ts'       : 95,
-  'src/proofs/connect/fixture/wallet-rpc-validation.ts' : 95,
-  'src/proofs/did-browser/did-browser-proof.ts'         : 70,
-  'src/proofs/did-server/did-server-child-protocol.ts'  : 85,
-  'src/proofs/did-server/did-server-runtime.ts'         : 95,
-  'src/proofs/did-server/server-private-did-proof.ts'   : 65,
-  'src/proofs/docker-proof.ts'                          : 95,
-  'src/runtime/private-pkarr-testnet.ts'                : 80,
+  'src/pkarr-publication-adapter.ts'                              : 95,
+  'src/pkarr-publication-journal.ts'                              : 95,
+  'src/pkarr-publication-server.ts'                               : 90,
+  'src/proof-result.ts'                                           : 95,
+  'src/proofs/connect/connect-browser-proof.ts'                   : 95,
+  'src/proofs/connect/connect-relay-runtime.ts'                   : 95,
+  'src/proofs/connect/connect-worker-boundary.ts'                 : 95,
+  'src/proofs/connect/fixture/wallet-rpc-validation.ts'           : 95,
+  'src/proofs/did-browser/did-browser-proof.ts'                   : 70,
+  'src/proofs/did-browser/did-browser-runtime.ts'                 : 20,
+  'src/proofs/did-browser/fixture/did-service-worker-protocol.ts' : 85,
+  'src/proofs/did-server/did-server-child-protocol.ts'            : 85,
+  'src/proofs/did-server/did-server-runtime.ts'                   : 95,
+  'src/proofs/did-server/server-private-did-proof.ts'             : 65,
+  'src/proofs/docker-proof.ts'                                    : 95,
+  'src/runtime/private-pkarr-testnet.ts'                          : 80,
 } as const;
 
 /** Throws when aggregate line coverage falls below the configured floor. */
