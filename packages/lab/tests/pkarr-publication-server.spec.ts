@@ -1,8 +1,10 @@
 import { join } from 'node:path';
+import { PKARR_PACKET_MAX_BYTES } from '../src/pkarr-publication-adapter.js';
 import { PkarrPublicationJournal } from '../src/pkarr-publication-journal.js';
 import { startPkarrPublicationServer } from '../src/pkarr-publication-server.js';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'bun:test';
+import { DidDht, DidDhtUtils } from '@enbox/dids';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 
 function packet(sequence: bigint): Uint8Array {
@@ -119,6 +121,19 @@ describe('Pkarr publication server', () => {
         journalLocation : join(directory, 'journal.sqlite'),
         upstreamBaseUrl : 'http://pkarr:15411/',
       })).rejects.toThrow('Expected an HTTP(S) origin');
+      await expect(startPkarrPublicationServer({
+        actorIngress    : true,
+        actorPort       : 65_536,
+        fetch           : async (): Promise<Response> => new Response(undefined, { status: 204 }),
+        journalLocation : join(directory, 'journal.sqlite'),
+        upstreamBaseUrl : 'http://pkarr:15411/',
+      })).rejects.toThrow('actor ingress port must be a safe integer between 0 and 65535');
+      await expect(startPkarrPublicationServer({
+        actorPort       : 4_000,
+        fetch           : async (): Promise<Response> => new Response(undefined, { status: 204 }),
+        journalLocation : join(directory, 'journal.sqlite'),
+        upstreamBaseUrl : 'http://pkarr:15411/',
+      })).rejects.toThrow('actor ingress port requires actor ingress to be enabled');
       expect(await readdir(directory)).toEqual([]);
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -138,6 +153,7 @@ describe('Pkarr publication server', () => {
         fetch           : async (): Promise<Response> => new Response(undefined, { status: 204 }),
         journalLocation,
         port            : blocker.port,
+        actorIngress    : true,
         resolverIngress : true,
         upstreamBaseUrl : 'http://pkarr:15411/',
       })).rejects.toThrow();
@@ -154,6 +170,52 @@ describe('Pkarr publication server', () => {
     await rm(directory, { force: true, recursive: true });
   });
 
+  it('should pin the actor route across restarts and release a failed actor bind', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
+    const journalLocation = join(directory, 'journal.sqlite');
+    const blocker = Bun.serve({
+      fetch    : (): Response => new Response(),
+      hostname : '127.0.0.1',
+      port     : 0,
+    });
+    const actorPort = blocker.port;
+    try {
+      await expect(startPkarrPublicationServer({
+        actorIngress    : true,
+        actorPort,
+        fetch           : async (): Promise<Response> => new Response(undefined, { status: 404 }),
+        journalLocation,
+        upstreamBaseUrl : 'http://pkarr:15411/',
+      })).rejects.toThrow();
+    } finally {
+      await blocker.stop(true);
+    }
+
+    const first = await startPkarrPublicationServer({
+      actorIngress    : true,
+      actorPort,
+      fetch           : async (): Promise<Response> => new Response(undefined, { status: 404 }),
+      journalLocation,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+    expect(first.actorEndpoint()).toBe(`http://127.0.0.1:${actorPort}/`);
+    await first.stop();
+
+    const reopened = await startPkarrPublicationServer({
+      actorIngress    : true,
+      actorPort,
+      fetch           : async (): Promise<Response> => new Response(undefined, { status: 404 }),
+      journalLocation,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+    try {
+      expect(reopened.actorEndpoint()).toBe(first.actorEndpoint());
+    } finally {
+      await reopened.stop();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   it('should expose a capability-guarded originless resolver without weakening the browser listener', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
     let identifierGets = 0;
@@ -163,7 +225,17 @@ describe('Pkarr publication server', () => {
         const url = new URL(String(input));
         if (url.pathname !== '/') {
           identifierGets += 1;
-          return new Response('signed-packet', { status: 200 });
+          return new Response('signed-packet', {
+            headers: {
+              'Access-Control-Allow-Credentials' : 'true',
+              'Access-Control-Allow-Origin'      : '*',
+              'Clear-Site-Data'                  : '"*"',
+              'Content-Type'                     : 'application/octet-stream',
+              'Set-Cookie'                       : 'secret=value',
+              'Timing-Allow-Origin'              : '*',
+            },
+            status: 200,
+          });
         }
         return new Response(undefined, { status: 404 });
       },
@@ -187,6 +259,7 @@ describe('Pkarr publication server', () => {
       );
       const rejected: Array<{ headers?: HeadersInit; method?: string; url: string }> = [
         { url: wrongCapability },
+        { url: `${validUrl}?` },
         { url: `${validUrl}?query=1` },
         { url: new URL('short', resolverUrl).toString() },
         { url: new URL(`${'y'.repeat(51)}b`, resolverUrl).toString() },
@@ -213,6 +286,11 @@ describe('Pkarr publication server', () => {
       expect(response.status).toBe(200);
       expect(await response.text()).toBe('signed-packet');
       expect(response.headers.get('access-control-allow-origin')).toBeNull();
+      expect(response.headers.get('access-control-allow-credentials')).toBeNull();
+      expect(response.headers.get('clear-site-data')).toBeNull();
+      expect(response.headers.get('content-type')).toBe('application/octet-stream');
+      expect(response.headers.get('set-cookie')).toBeNull();
+      expect(response.headers.get('timing-allow-origin')).toBeNull();
       expect(response.headers.get('cache-control')).toBe('no-store');
       expect(response.headers.get('content-security-policy')).toBe('default-src \'none\'; frame-ancestors \'none\'');
       expect(response.headers.get('cross-origin-resource-policy')).toBe('same-origin');
@@ -225,6 +303,224 @@ describe('Pkarr publication server', () => {
       await server.stop();
       await expect(fetch(validUrl, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
       expect(server.resolverObservation()).toEqual({ admitted: 1, rejected: rejected.length });
+    } finally {
+      await server.stop();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it('should expose a nonsecret actor ingress without weakening the browser or resolver policies', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'enbox-lab-pkarr-server-'));
+    const journalLocation = join(directory, 'journal.sqlite');
+    const upstreamRequests: Array<{ body?: Uint8Array; contentType: string | null; method: string; pathname: string }> = [];
+    const signedPacket = packet(7n);
+    const did = await DidDht.create({ options: { publish: false } });
+    const server = await startPkarrPublicationServer({
+      actorIngress   : true,
+      allowedOrigins : ['http://localhost:18443'],
+      fetch          : async (input, init): Promise<Response> => {
+        const url = new URL(String(input));
+        const method = init?.method ?? 'GET';
+        const body = init?.body === undefined ? undefined : new Uint8Array(await new Response(init.body).arrayBuffer());
+        upstreamRequests.push({
+          body,
+          contentType : new Headers(init?.headers).get('content-type'),
+          method,
+          pathname    : url.pathname,
+        });
+        if (url.pathname === '/') {
+          return new Response(undefined, { status: 404 });
+        }
+        if (method === 'PUT') {
+          return new Response(undefined, { status: 204 });
+        }
+        return new Response(new Blob([signedPacket as BlobPart]), {
+          headers: {
+            'Access-Control-Allow-Credentials' : 'true',
+            'Access-Control-Allow-Origin'      : '*',
+            'Clear-Site-Data'                  : '"*"',
+            'Content-Type'                     : 'application/octet-stream',
+            'Set-Cookie'                       : 'secret=value',
+            'Timing-Allow-Origin'              : '*',
+          },
+          status: 200,
+        });
+      },
+      journalLocation,
+      resolverIngress : true,
+      upstreamBaseUrl : 'http://pkarr:15411/',
+    });
+
+    const actorEndpoint = server.actorEndpoint();
+    const resolverEndpoint = server.resolverEndpoint();
+    if (actorEndpoint === undefined || resolverEndpoint === undefined) {
+      throw new Error('Expected actor and resolver ingress endpoints.');
+    }
+    const actorOrigin = new URL(actorEndpoint).origin;
+    const resolverUrl = new URL(resolverEndpoint);
+    const resolverCapability = resolverUrl.pathname.split('/')[3]!;
+    const identifier = did.uri.slice('did:dht:'.length);
+    const actorUrl = new URL(identifier, actorEndpoint).toString();
+    const resolverIdentifierUrl = new URL(identifier, resolverEndpoint).toString();
+
+    try {
+      expect(actorEndpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/u);
+      expect(actorEndpoint).not.toMatch(/[0-9a-f]{64}/u);
+      expect(resolverEndpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/__lab\/resolver\/[0-9a-f]{64}\/$/u);
+      expect(actorOrigin).not.toBe(resolverUrl.origin);
+      expect(JSON.stringify(server)).not.toContain(resolverCapability);
+
+      const upstreamBeforeRejections = upstreamRequests.length;
+      const rejected: Array<{ body?: BodyInit; headers?: HeadersInit; method?: string; url: string }> = [
+        { url: actorEndpoint },
+        { url: `${actorUrl}?` },
+        { url: `${actorUrl}?query=1` },
+        { url: new URL(`nested/${identifier}`, actorEndpoint).toString() },
+        { url: `${actorEndpoint}%2F${identifier}` },
+        { url: `${actorUrl}%2Fextra` },
+        { url: new URL('short', actorEndpoint).toString() },
+        { url: new URL(`${'y'.repeat(51)}b`, actorEndpoint).toString() },
+        { url: `${actorOrigin}${resolverUrl.pathname}${identifier}` },
+        { headers: { Origin: 'http://localhost:18443' }, url: actorUrl },
+        { headers: { Origin: 'https://attacker.invalid' }, url: actorUrl },
+        { headers: { Referer: 'http://localhost:18443/' }, url: actorUrl },
+        { headers: { 'Sec-Fetch-Dest': 'empty' }, url: actorUrl },
+        { headers: { 'Sec-Fetch-Mode': 'cors' }, url: actorUrl },
+        { headers: { 'Sec-Fetch-Site': 'same-origin' }, url: actorUrl },
+        { headers: { Host: 'localhost' }, url: actorUrl },
+        { method: 'OPTIONS', url: actorUrl },
+        { body: new Blob([packet(8n) as BlobPart]), method: 'POST', url: actorUrl },
+      ];
+      for (const request of rejected) {
+        const response = await fetch(request.url, {
+          body    : request.body,
+          headers : request.headers,
+          method  : request.method,
+        });
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe('not found');
+        expect(response.headers.get('access-control-allow-origin')).toBeNull();
+        expect(response.headers.get('cache-control')).toBe('no-store');
+        expect(response.headers.get('cross-origin-resource-policy')).toBe('same-origin');
+        expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+      }
+      expect(upstreamRequests).toHaveLength(upstreamBeforeRejections);
+
+      const crossCapability = await fetch(`${resolverUrl.origin}/__lab/actor/${resolverCapability}/${identifier}`);
+      expect(crossCapability.status).toBe(404);
+      const resolverPut = await fetch(resolverIdentifierUrl, {
+        body   : new Blob([packet(8n) as BlobPart]),
+        method : 'PUT',
+      });
+      expect(resolverPut.status).toBe(404);
+      expect(upstreamRequests).toHaveLength(upstreamBeforeRejections);
+
+      const tooLarge = new Uint8Array(PKARR_PACKET_MAX_BYTES + 1);
+      const oversized = await fetch(actorUrl, {
+        body    : new Blob([tooLarge as BlobPart]),
+        headers : { 'Content-Type': 'application/octet-stream' },
+        method  : 'PUT',
+      });
+      expect(oversized.status).toBe(413);
+      const streamed = await fetch(actorUrl, {
+        body: new ReadableStream<Uint8Array>({
+          start(controller): void {
+            controller.enqueue(tooLarge.slice(0, PKARR_PACKET_MAX_BYTES));
+            controller.enqueue(tooLarge.slice(PKARR_PACKET_MAX_BYTES));
+            controller.close();
+          },
+        }),
+        headers : { 'Content-Type': 'application/octet-stream' },
+        method  : 'PUT',
+      });
+      expect(streamed.status).toBe(413);
+      expect(upstreamRequests).toHaveLength(upstreamBeforeRejections);
+      expect(server.actorObservation()).toEqual({
+        admittedGets : 0,
+        admittedPuts : 1,
+        rejected     : rejected.length,
+      });
+
+      const maximumPacket = new Uint8Array(PKARR_PACKET_MAX_BYTES);
+      const maximumIdentifier = `${'b'.repeat(51)}o`;
+      const maximumPut = await fetch(new URL(maximumIdentifier, actorEndpoint), {
+        body    : new Blob([maximumPacket as BlobPart]),
+        headers : { 'Content-Type': 'application/octet-stream' },
+        method  : 'PUT',
+      });
+      expect(maximumPut.status).toBe(204);
+      expect(upstreamRequests.at(-1)).toEqual({
+        body        : maximumPacket,
+        contentType : 'application/octet-stream',
+        method      : 'PUT',
+        pathname    : `/${maximumIdentifier}`,
+      });
+
+      const get = await fetch(actorUrl);
+      expect(get.status).toBe(200);
+      expect(get.headers.get('content-type')).toBe('application/octet-stream');
+      expect([...new Uint8Array(await get.arrayBuffer())]).toEqual([...signedPacket]);
+      expect(get.headers.get('access-control-allow-origin')).toBeNull();
+      expect(get.headers.get('access-control-allow-credentials')).toBeNull();
+      expect(get.headers.get('clear-site-data')).toBeNull();
+      expect(get.headers.get('set-cookie')).toBeNull();
+      expect(get.headers.get('timing-allow-origin')).toBeNull();
+
+      const publication = await DidDht.publish({
+        allowPrivateGatewayUri : true,
+        did,
+        gatewayUri             : actorEndpoint,
+      });
+      expect(publication.didDocumentMetadata.published).toBe(true);
+      expect(upstreamRequests.at(-2)).toEqual({
+        body        : undefined,
+        contentType : null,
+        method      : 'GET',
+        pathname    : `/${identifier}`,
+      });
+      const publicationRequest = upstreamRequests.at(-1);
+      expect(publicationRequest).toMatchObject({
+        contentType : 'application/octet-stream',
+        method      : 'PUT',
+        pathname    : `/${identifier}`,
+      });
+      const publishedBody = publicationRequest?.body;
+      if (publishedBody === undefined) {
+        throw new Error('Expected the actor publication body to reach upstream.');
+      }
+      expect(server.actorObservation()).toEqual({
+        admittedGets : 1,
+        admittedPuts : 3,
+        rejected     : rejected.length,
+      });
+      expect(server.resolverObservation()).toEqual({ admitted: 0, rejected: 2 });
+
+      await server.stop();
+      const journal = new PkarrPublicationJournal(journalLocation);
+      try {
+        const persistedPacket = journal.get(identifier)?.packet;
+        if (persistedPacket === undefined) {
+          throw new Error('Expected the actor publication in the durable journal.');
+        }
+        expect(persistedPacket).toEqual(publishedBody);
+        const dnsPacket = await DidDhtUtils.parseBep44GetMessage({
+          bep44Message: {
+            k   : DidDhtUtils.identifierToIdentityKeyBytes({ didUri: did.uri }),
+            seq : Number(new DataView(persistedPacket.buffer, persistedPacket.byteOffset).getBigUint64(64)),
+            sig : persistedPacket.slice(0, 64),
+            v   : persistedPacket.slice(72),
+          },
+        });
+        const authoritativeGateways = (dnsPacket.answers ?? []).flatMap((answer): string[] => (
+          answer.type === 'NS' && typeof answer.data === 'string' ? [answer.data] : []
+        ));
+        expect(authoritativeGateways).toEqual([actorEndpoint]);
+        expect(authoritativeGateways.join('\n')).not.toContain(resolverCapability);
+      } finally {
+        journal.close();
+      }
+      await expect(fetch(actorUrl, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
+      await expect(fetch(resolverIdentifierUrl, { signal: AbortSignal.timeout(1_000) })).rejects.toThrow();
     } finally {
       await server.stop();
       await rm(directory, { force: true, recursive: true });
@@ -318,7 +614,8 @@ describe('Pkarr publication server', () => {
     let markPutStarted = (): void => {};
     const putStarted = new Promise<void>((resolve): void => { markPutStarted = resolve; });
     const server = await startPkarrPublicationServer({
-      fetch: async (_input, init): Promise<Response> => {
+      actorIngress : true,
+      fetch        : async (_input, init): Promise<Response> => {
         if (init?.method !== 'PUT') {
           return new Response(undefined, { status: 404 });
         }
@@ -332,10 +629,14 @@ describe('Pkarr publication server', () => {
       shutdownTimeoutMs : 2_000,
       upstreamBaseUrl   : 'http://pkarr:15411/',
     });
-    const packet = new Uint8Array(80);
-    new DataView(packet.buffer).setBigUint64(64, 1n);
-    const publication = fetch(new URL('key-one', server.endpoint), {
-      body   : new Blob([packet as BlobPart]),
+    const actorEndpoint = server.actorEndpoint();
+    if (actorEndpoint === undefined) {
+      throw new Error('Expected the actor ingress endpoint.');
+    }
+    const publicationPacket = new Uint8Array(80);
+    new DataView(publicationPacket.buffer).setBigUint64(64, 1n);
+    const publication = fetch(new URL('y'.repeat(52), actorEndpoint), {
+      body   : new Blob([publicationPacket as BlobPart]),
       method : 'PUT',
     }).catch((error: unknown): unknown => error);
 

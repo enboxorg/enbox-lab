@@ -271,6 +271,12 @@ function transportHarness(options: TransportHarnessOptions = {}): {
     startAdapter    : async (adapterOptions) => {
       adapterFetch = adapterOptions.fetch;
       return {
+        actorEndpoint    : (): undefined => undefined,
+        actorObservation : (): { admittedGets: number; admittedPuts: number; rejected: number } => ({
+          admittedGets : 0,
+          admittedPuts : 0,
+          rejected     : 0,
+        }),
         browserRejectionCount : (): number => rejections,
         endpoint              : 'http://127.0.0.1:41003/',
         resolverEndpoint      : (): undefined => undefined,
