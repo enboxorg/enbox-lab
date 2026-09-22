@@ -804,17 +804,13 @@ async function runServerPrivateDidProofWithDependencies(
       }
 
       stage = 'runtime-start';
-      const runtimeStartResults = await Promise.allSettled([
-        resources.runtimeA.start(),
-        resources.runtimeB.start(),
-      ]);
-      resources.runtimeAStarted = runtimeStartResults[0].status === 'fulfilled';
-      resources.runtimeBStarted = runtimeStartResults[1].status === 'fulfilled';
-      if (runtimeStartResults[0].status !== 'fulfilled' || runtimeStartResults[1].status !== 'fulfilled') {
-        throw new Error('Server private DID proof could not start both server children');
-      }
-      const runtimeEvidenceA = runtimeStartResults[0].value;
-      const runtimeEvidenceB = runtimeStartResults[1].value;
+      // Bun's cold SQL/server initialization can contend when two released children start at the
+      // same instant. The proof requires concurrent operation, not concurrent startup, so remove
+      // that nondeterministic launch race while keeping both children live for every observation.
+      const runtimeEvidenceA = await resources.runtimeA.start();
+      resources.runtimeAStarted = true;
+      const runtimeEvidenceB = await resources.runtimeB.start();
+      resources.runtimeBStarted = true;
 
       stage = 'proof-execution';
       const boundary = await dependencies.executeScenario({
