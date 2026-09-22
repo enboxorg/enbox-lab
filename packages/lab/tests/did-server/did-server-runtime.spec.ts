@@ -82,6 +82,82 @@ describe('DidServerRuntime readiness protocol', () => {
 });
 
 describe('DidServerRuntime lifecycle', () => {
+  it('should retry a thrown startup network error before accepting the exact health contract', async () => {
+    let attempts = 0;
+    const runtime = await DidServerRuntime.create(RESOLVER_ENDPOINT, {
+      startupFetch: async (input, init): Promise<Response> => {
+        attempts += 1;
+        if (attempts === 1) { throw new TypeError('injected listener-readiness race'); }
+        return fetch(input, init);
+      },
+    });
+    try {
+      const evidence = await runtime.start();
+      expect(evidence.health).toEqual({ ok: true });
+      expect(attempts).toBe(4);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('should reject a non-success startup response without retrying it', async () => {
+    let attempts = 0;
+    const runtime = await DidServerRuntime.create(RESOLVER_ENDPOINT, {
+      startupFetch: async (): Promise<Response> => {
+        attempts += 1;
+        return new Response('not ready', { status: 503 });
+      },
+    });
+    try {
+      await expect(runtime.start()).rejects.toThrow('backend health check returned HTTP 503');
+      expect(attempts).toBe(1);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('should bound persistent startup network failures with a runtime diagnostic', async () => {
+    let attempts = 0;
+    const runtime = await DidServerRuntime.create(RESOLVER_ENDPOINT, {
+      startupFetch: async (): Promise<Response> => {
+        attempts += 1;
+        throw new TypeError('injected persistent network failure');
+      },
+    });
+    try {
+      await expect(runtime.start()).rejects.toThrow(
+        /^DidServerRuntime: startup verification failed after \d+ network attempts$/u,
+      );
+      expect(attempts).toBeGreaterThan(1);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('should report a child exit observed during a retried startup request', async () => {
+    let killed = false;
+    const runtimeReference: { current?: DidServerRuntime } = {};
+    const runtime = await DidServerRuntime.create(RESOLVER_ENDPOINT, {
+      startupFetch: async (): Promise<Response> => {
+        if (!killed) {
+          killed = true;
+          const pid = runtimeReference.current?.pid;
+          if (pid === undefined) { throw new Error('injected startup fetch ran before child spawn'); }
+          process.kill(pid, 'SIGKILL');
+        }
+        throw new TypeError('injected request failure after child exit');
+      },
+    });
+    runtimeReference.current = runtime;
+    try {
+      await expect(runtime.start()).rejects.toThrow(
+        /^DidServerRuntime: child exited with code \d+ during startup verification/u,
+      );
+    } finally {
+      await runtime.stop();
+    }
+  });
+
   it('should run the exact released server through a stable proxy and remove both live endpoints', async () => {
     const inheritedMessageStore = process.env.DWN_STORAGE_MESSAGES;
     const inheritedRegistrationStore = process.env.DWN_REGISTRATION_STORE_URL;

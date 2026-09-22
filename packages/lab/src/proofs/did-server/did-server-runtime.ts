@@ -24,6 +24,8 @@ const OUTPUT_TAIL_LIMIT = 16_384;
 const READINESS_MAX_LINE_BYTES = 512;
 const READINESS_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 2_000;
+const STARTUP_FETCH_ATTEMPT_TIMEOUT_MS = 500;
+const STARTUP_FETCH_RETRY_INTERVAL_MS = 25;
 
 type DidServerChildProcess = Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
 
@@ -50,6 +52,11 @@ type ProxyTarget = {
   backendOrigin?: string;
   publicOrigin?: string;
 };
+
+type StartupFetch = (
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => ReturnType<typeof fetch>;
 
 type DeferredSignal = Readonly<{
   promise: Promise<void>;
@@ -96,6 +103,7 @@ export type DidServerRuntimeStopEvidence = Readonly<{
 export type DidServerRuntimeDependencies = Readonly<{
   beforeChildStart?: () => Promise<void>;
   removeStorage?: (directory: string) => Promise<void>;
+  startupFetch?: StartupFetch;
 }>;
 
 function delay(durationMs: number): Promise<void> {
@@ -314,6 +322,7 @@ export class DidServerRuntime {
   private readonly _proxy: Server<undefined>;
   private readonly _proxyTarget: ProxyTarget;
   private readonly _removeStorage: (directory: string) => Promise<void>;
+  private readonly _startupFetch: StartupFetch;
   private _child?: DidServerChildProcess;
   private _childShutdownPromise?: Promise<void>;
   private _cleanupPromise?: Promise<DidServerRuntimeStopEvidence>;
@@ -347,6 +356,7 @@ export class DidServerRuntime {
       force     : true,
       recursive : true,
     }));
+    this._startupFetch = dependencies.startupFetch ?? fetch;
     this.#resolverBaseUri = resolverBaseUri;
   }
 
@@ -530,15 +540,48 @@ export class DidServerRuntime {
     this.#outputTail = `${this.#outputTail}${value}`.slice(-OUTPUT_TAIL_LIMIT);
   }
 
+  private async fetchStartupResponse(url: string): Promise<Response> {
+    const deadline = performance.now() + REQUEST_TIMEOUT_MS;
+    let attempts = 0;
+    while (performance.now() < deadline) {
+      attempts += 1;
+      try {
+        const remainingMs = Math.max(1, Math.ceil(deadline - performance.now()));
+        return await this._startupFetch(url, {
+          redirect : 'error',
+          signal   : AbortSignal.timeout(Math.min(STARTUP_FETCH_ATTEMPT_TIMEOUT_MS, remainingMs)),
+        });
+      } catch {
+        const child = this._child;
+        if (child === undefined) {
+          throw new Error('DidServerRuntime: child is unavailable during startup verification');
+        }
+        const remainingMs = deadline - performance.now();
+        if (remainingMs <= 0) { break; }
+        const outcome = await Promise.race([
+          child.exited.then((exitCode): Readonly<{ exitCode: number; type: 'exit' }> => ({ exitCode, type: 'exit' })),
+          delay(Math.min(STARTUP_FETCH_RETRY_INTERVAL_MS, remainingMs))
+            .then((): Readonly<{ type: 'retry' }> => ({ type: 'retry' })),
+        ]);
+        if (outcome.type === 'exit') {
+          await Promise.allSettled(this._outputDrainPromises);
+          const output = redactOutput(this.#outputTail.trim(), this.#resolverBaseUri);
+          throw new Error(
+            `DidServerRuntime: child exited with code ${outcome.exitCode} during startup verification` +
+            `${output.length > 0 ? `: ${output}` : ''}`,
+          );
+        }
+      }
+    }
+    throw new Error(`DidServerRuntime: startup verification failed after ${attempts} network attempts`);
+  }
+
   private async collectEvidence(
     command: string[],
     environment: Record<string, string>,
     ready: DidServerChildReady,
   ): Promise<DidServerRuntimeEvidence> {
-    const backendHealthResponse = await fetch(`${ready.origin}/health`, {
-      redirect : 'error',
-      signal   : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    const backendHealthResponse = await this.fetchStartupResponse(`${ready.origin}/health`);
     if (!backendHealthResponse.ok) {
       await backendHealthResponse.body?.cancel().catch((): void => {});
       throw new Error(`DidServerRuntime: backend health check returned HTTP ${backendHealthResponse.status}`);
@@ -550,8 +593,8 @@ export class DidServerRuntime {
 
     this._proxyTarget.backendOrigin = ready.origin;
     const [healthResponse, infoResponse] = await Promise.all([
-      fetch(`${this._origin}/health`, { redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }),
-      fetch(`${this._origin}/info`, { redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }),
+      this.fetchStartupResponse(`${this._origin}/health`),
+      this.fetchStartupResponse(`${this._origin}/info`),
     ]);
     if (!healthResponse.ok) {
       await healthResponse.body?.cancel().catch((): void => {});
