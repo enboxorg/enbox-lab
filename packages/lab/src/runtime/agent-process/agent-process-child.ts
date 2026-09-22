@@ -1,20 +1,44 @@
-import type { EnboxUserAgent as EnboxUserAgentType } from '@enbox/agent';
+import type { ConnectRequest } from '@enbox/connect';
+import type {
+  AgentProcessChildApproveNoteWritePopupCommand,
+  AgentProcessChildCommandFailure,
+  AgentProcessChildNoteWritePopupApproved,
+} from './agent-process-child-protocol.js';
+import type {
+  ConnectApprovalProgressPhase,
+  ConnectApprovalResult,
+  EnboxUserAgent as EnboxUserAgentType,
+} from '@enbox/agent';
 
+import { ConnectProvider } from '@enbox/connect';
 import { fileURLToPath } from 'node:url';
+import { getDwnEndpointStatus } from '@enbox/dids';
+import { isDeepStrictEqual } from 'node:util';
 import { stat } from 'node:fs/promises';
 
-import { EnboxUserAgent } from '@enbox/agent';
-import { getDwnEndpointStatus } from '@enbox/dids';
-
 import {
+  AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES,
+  AGENT_PROCESS_APPROVAL_PHASES,
   AGENT_PROCESS_CHILD_MAX_LINE_BYTES,
   AGENT_PROCESS_PACKAGE_NAME,
   AGENT_PROCESS_PACKAGE_VERSION,
   isDidDhtUri,
+  parseAgentProcessChildActiveCommand,
   parseAgentProcessChildSecretCommand,
   parseAgentProcessChildStartCommand,
-  parseAgentProcessChildStopCommand,
 } from './agent-process-child-protocol.js';
+import {
+  assertLabNoteWritePopupRequest,
+  cloneLabNoteWritePopupRequest,
+  fingerprintLabNoteWritePopupRequest,
+  LAB_NOTE_WRITE_APP_NAME,
+  LAB_NOTE_WRITE_MAX_APPROVALS,
+  LAB_NOTE_WRITE_PERMISSION_REQUEST,
+  LAB_NOTE_WRITE_PROTOCOL_URI,
+  LAB_NOTE_WRITE_SESSION_TTL_SECONDS,
+} from './note-write-approval.js';
+import { DwnInterfaceName, DwnMethodName, PermissionsProtocol } from '@enbox/dwn-sdk-js';
+import { DwnPermissionGrant, EnboxUserAgent, executeConnectApproval } from '@enbox/agent';
 
 const MAX_OUTPUT_LINE_BYTES = 1_024;
 
@@ -59,35 +83,59 @@ async function assertStorageDirectory(storageDirectory: string): Promise<void> {
   }
 }
 
-async function* readBoundedInputLines(signal: AbortSignal): AsyncGenerator<string> {
-  const bytes: number[] = [];
-  const reader = Bun.stdin.stream().getReader();
-  const cancel = (): void => { void reader.cancel().catch((): void => {}); };
-  signal.addEventListener('abort', cancel, { once: true });
-  if (signal.aborted) { cancel(); }
-  try {
+class BoundedInputLineReader {
+  private readonly _bytes: number[] = [];
+  private readonly _cancel: () => void;
+  private readonly _reader = Bun.stdin.stream().getReader();
+  private readonly _signal: AbortSignal;
+  private _ended = false;
+
+  public constructor(signal: AbortSignal) {
+    this._signal = signal;
+    this._cancel = (): void => { void this._reader.cancel().catch((): void => {}); };
+    signal.addEventListener('abort', this._cancel, { once: true });
+    if (signal.aborted) { this._cancel(); }
+  }
+
+  public async readLine(maximumBytes: number): Promise<string | undefined> {
     while (true) {
-      const result = await reader.read();
-      if (result.done) { break; }
+      const newlineIndex = this._bytes.indexOf(0x0a);
+      if (newlineIndex !== -1) {
+        if (newlineIndex > maximumBytes) { throw fixedError('input line exceeds the limit'); }
+        const lineBytes = this._bytes.splice(0, newlineIndex + 1);
+        lineBytes.pop();
+        if (lineBytes.at(-1) === 0x0d) { lineBytes.pop(); }
+        return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(lineBytes));
+      }
+      if (this._bytes.length > maximumBytes) { throw fixedError('input line exceeds the limit'); }
+      if (this._ended) {
+        if (this._bytes.length === 0) { return undefined; }
+        const line = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(this._bytes));
+        this._bytes.length = 0;
+        return line;
+      }
+      const result = await this._reader.read();
+      if (result.done) {
+        this._ended = true;
+        continue;
+      }
       for (const byte of result.value) {
-        if (byte === 0x0a) {
-          if (bytes.at(-1) === 0x0d) { bytes.pop(); }
-          yield new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
-          bytes.length = 0;
-        } else {
-          if (bytes.length >= AGENT_PROCESS_CHILD_MAX_LINE_BYTES) {
-            throw fixedError('input line exceeds the limit');
-          }
-          bytes.push(byte);
+        this._bytes.push(byte);
+        const firstNewline = this._bytes.indexOf(0x0a);
+        if (firstNewline === -1 && this._bytes.length > maximumBytes) {
+          throw fixedError('input line exceeds the limit');
+        }
+        if (firstNewline !== -1 && this._bytes.length - firstNewline - 1 > AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES) {
+          throw fixedError('buffered active input exceeds the limit');
         }
       }
     }
-    if (bytes.length > 0) {
-      yield new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes));
-    }
-  } finally {
-    signal.removeEventListener('abort', cancel);
-    reader.releaseLock();
+  }
+
+  public async close(): Promise<void> {
+    this._signal.removeEventListener('abort', this._cancel);
+    await this._reader.cancel().catch((): void => {});
+    this._reader.releaseLock();
   }
 }
 
@@ -97,6 +145,22 @@ function writeRecord(record: Record<string, unknown>): void {
     throw fixedError('output record exceeds the limit');
   }
   process.stdout.write(line);
+}
+
+function writeActiveRecord(record: Record<string, unknown>): void {
+  const line = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(line, 'utf8') > AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES) {
+    throw fixedError('active output record exceeds the limit');
+  }
+  process.stdout.write(line);
+}
+
+function commandFailure(
+  id: string,
+  code: AgentProcessChildCommandFailure['code'],
+  needsReconciliation: boolean,
+): AgentProcessChildCommandFailure {
+  return { code, id, needsReconciliation, type: 'agent-command-failed' };
 }
 
 function createShutdownSignal(): Readonly<{
@@ -132,15 +196,15 @@ async function shutdownAgent(agent: EnboxUserAgentType): Promise<void> {
 
 async function activateWithOneUseSecret(
   agent: EnboxUserAgentType,
-  lines: AsyncGenerator<string>,
+  input: BoundedInputLineReader,
   signal: Promise<ShutdownSignal>,
   firstLaunch: boolean,
   remoteDwnOrigin: string,
 ): Promise<SecretFreeActivation | undefined> {
-  const outcome = await Promise.race([lines.next(), signal]);
-  if ('type' in outcome || outcome.done) { return undefined; }
+  const outcome = await Promise.race([input.readLine(AGENT_PROCESS_CHILD_MAX_LINE_BYTES), signal]);
+  if (typeof outcome !== 'string') { return undefined; }
 
-  const command = parseAgentProcessChildSecretCommand(outcome.value);
+  const command = parseAgentProcessChildSecretCommand(outcome);
   if ((command.type === 'initialize') !== firstLaunch) {
     throw fixedError('secret command does not match the durable vault state');
   }
@@ -165,6 +229,115 @@ async function activateWithOneUseSecret(
   };
 }
 
+async function executeAndSealNoteWriteApproval(
+  agent: EnboxUserAgentType,
+  request: ConnectRequest,
+): Promise<string> {
+  const phases: ConnectApprovalProgressPhase[] = [];
+  const result = await executeConnectApproval({
+    agent,
+    approvedProtocolOverrides : [],
+    approvedSessionTtlSeconds : LAB_NOTE_WRITE_SESSION_TTL_SECONDS,
+    onProgress                : ({ phase }): void => { phases.push(phase); },
+    providerDid               : agent.agentDid.uri,
+    request,
+    transport                 : 'postMessage',
+  });
+  assertNoteWriteApprovalResult(result, request, phases, agent.agentDid.uri);
+  const { responseSigner, ...approval } = result;
+  return ConnectProvider.sealApprovedResponse({
+    approval,
+    providerDid : agent.agentDid.uri,
+    request,
+    signer      : responseSigner,
+  });
+}
+
+function assertNoteWriteApprovalResult(
+  result: ConnectApprovalResult,
+  request: ConnectRequest,
+  phases: readonly ConnectApprovalProgressPhase[],
+  providerDid: string,
+): void {
+  if (result.delegateGrants.length !== 2 || result.sessionRevocations.length !== 1 ||
+    result.delegatePortableDid?.uri !== result.delegateDid || result.responseSigner.uri !== result.delegateDid ||
+    !isDeepStrictEqual(result.delegatePortableDid.privateKeys?.map((key) => key.crv).sort(), ['Ed25519', 'X25519']) ||
+    phases.length !== AGENT_PROCESS_APPROVAL_PHASES.length ||
+    phases.some((phase, index): boolean => phase !== AGENT_PROCESS_APPROVAL_PHASES[index])) {
+    throw fixedError('approval result did not satisfy the fixed note-write contract');
+  }
+
+  const grants = result.delegateGrants.map((message) => DwnPermissionGrant.parse(message));
+  const sessionGrant = grants.find((grant): boolean => grant.scope.protocol === LAB_NOTE_WRITE_PROTOCOL_URI);
+  if (sessionGrant === undefined) {
+    throw fixedError('approval result omitted the fixed note-write grant');
+  }
+  const revocationGrant = grants.find((grant): boolean => grant.id !== sessionGrant.id);
+  const session = sessionGrant.connectSession;
+  const metadata = request.clientMetadata;
+  const createdAt = session === undefined ? Number.NaN : Date.parse(session.createdAt);
+  const expiresAt = session === undefined ? Number.NaN : Date.parse(session.expiresAt);
+  if (revocationGrant === undefined || session === undefined || metadata === undefined ||
+    sessionGrant.grantor !== providerDid || sessionGrant.grantee !== result.delegateDid ||
+    sessionGrant.delegated !== true ||
+    !isDeepStrictEqual(sessionGrant.scope, LAB_NOTE_WRITE_PERMISSION_REQUEST.permissionScopes[0]) ||
+    session.appName !== LAB_NOTE_WRITE_APP_NAME || session.origin !== metadata.origin ||
+    session.transport !== 'postMessage' || session.expiresAt !== sessionGrant.dateExpires ||
+    session.appIcon !== undefined || session.applicationId !== undefined ||
+    session.userAgent !== metadata.userAgent || session.platform !== metadata.platform ||
+    session.language !== metadata.language || !isDeepStrictEqual(session.languages, metadata.languages) ||
+    session.timezone !== metadata.timezone || !Number.isFinite(createdAt) || !Number.isFinite(expiresAt) ||
+    expiresAt - createdAt !== LAB_NOTE_WRITE_SESSION_TTL_SECONDS * 1_000 ||
+    revocationGrant.grantor !== providerDid || revocationGrant.grantee !== result.delegateDid ||
+    revocationGrant.delegated !== true || revocationGrant.dateExpires !== sessionGrant.dateExpires ||
+    revocationGrant.connectSession !== undefined ||
+    !isDeepStrictEqual(revocationGrant.scope, {
+      contextId : sessionGrant.id,
+      interface : DwnInterfaceName.Records,
+      method    : DwnMethodName.Write,
+      protocol  : PermissionsProtocol.uri,
+    }) || !isDeepStrictEqual(result.sessionRevocations, [{
+    grantId           : sessionGrant.id,
+    revocationGrantId : revocationGrant.id,
+  }])) {
+    throw fixedError('approval grants did not satisfy the fixed note-write policy');
+  }
+}
+
+async function approveNoteWritePopupRequest(
+  command: AgentProcessChildApproveNoteWritePopupCommand,
+  agent: EnboxUserAgentType,
+  seen: Set<string>,
+  reconciliationRequired: boolean,
+): Promise<AgentProcessChildNoteWritePopupApproved | AgentProcessChildCommandFailure> {
+  if (reconciliationRequired) {
+    return commandFailure(command.id, 'reconciliation-required', true);
+  }
+  let request: ConnectRequest;
+  try {
+    request = cloneLabNoteWritePopupRequest(command.request);
+    assertLabNoteWritePopupRequest(request, agent.agentDid.uri, command.dappOrigin);
+  } catch {
+    return commandFailure(command.id, 'invalid-request', false);
+  }
+  const fingerprint = await fingerprintLabNoteWritePopupRequest(request);
+  if (seen.has(fingerprint)) {
+    return commandFailure(command.id, 'replayed-request', false);
+  }
+  if (seen.size >= LAB_NOTE_WRITE_MAX_APPROVALS) {
+    return commandFailure(command.id, 'capacity-exceeded', false);
+  }
+
+  // Consume before the first side effect. Every later failure is outcome-unknown and cannot be retried.
+  seen.add(fingerprint);
+  try {
+    const idToken = await executeAndSealNoteWriteApproval(agent, request);
+    return { id: command.id, idToken, type: 'note-write-popup-approved' };
+  } catch {
+    return commandFailure(command.id, 'outcome-unknown', true);
+  }
+}
+
 async function runChild(): Promise<void> {
   // Keep stdout as an exact machine protocol even if a released dependency logs during startup.
   console.log = (): void => {};
@@ -173,13 +346,13 @@ async function runChild(): Promise<void> {
   console.error = (): void => {};
 
   const shutdownSignal = createShutdownSignal();
-  const lines = readBoundedInputLines(shutdownSignal.signal);
+  const input = new BoundedInputLineReader(shutdownSignal.signal);
   let agent: EnboxUserAgentType | undefined;
   let cleanShutdown = false;
   try {
-    const first = await lines.next();
-    if (first.done) { throw fixedError('startup command is missing'); }
-    const start = parseAgentProcessChildStartCommand(first.value);
+    const first = await input.readLine(AGENT_PROCESS_CHILD_MAX_LINE_BYTES);
+    if (first === undefined) { throw fixedError('startup command is missing'); }
+    const start = parseAgentProcessChildStartCommand(first);
     await Promise.all([assertReleasedAgent(), assertStorageDirectory(start.storageDirectory)]);
 
     // These defaults are process-global in the released SDK, so set them only inside this
@@ -206,7 +379,7 @@ async function runChild(): Promise<void> {
 
     const activation = await activateWithOneUseSecret(
       agent,
-      lines,
+      input,
       shutdownSignal.promise,
       firstLaunch,
       start.remoteDwnOrigin,
@@ -217,8 +390,6 @@ async function runChild(): Promise<void> {
       writeRecord({ locked: true, type: 'stopped' });
       return;
     }
-    // Resume the input generator immediately so its yielded secret line is no longer retained.
-    const stopInput = lines.next();
     writeRecord({
       agentDid         : activation.agentDid,
       dwnEndpoints     : [start.remoteDwnOrigin],
@@ -232,16 +403,26 @@ async function runChild(): Promise<void> {
       type             : 'active',
     });
 
-    const stopOutcome = await Promise.race([stopInput, shutdownSignal.promise]);
-    if (!('type' in stopOutcome) && !stopOutcome.done) {
-      parseAgentProcessChildStopCommand(stopOutcome.value);
+    const seen = new Set<string>();
+    let reconciliationRequired = false;
+    while (true) {
+      const line = await input.readLine(AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES);
+      if (line === undefined) { break; }
+      const command = parseAgentProcessChildActiveCommand(line);
+      if (command.type === 'stop') { break; }
+
+      const result = await approveNoteWritePopupRequest(command, agent, seen, reconciliationRequired);
+      if (result.type === 'agent-command-failed' && result.needsReconciliation) {
+        reconciliationRequired = true;
+      }
+      writeActiveRecord(result);
     }
     await shutdownAgent(agent);
     cleanShutdown = true;
     writeRecord({ locked: true, type: 'stopped' });
   } finally {
     shutdownSignal.dispose();
-    await lines.return(undefined).catch((): void => {});
+    await input.close().catch((): void => {});
     if (agent !== undefined && !cleanShutdown) {
       await shutdownAgent(agent).catch((): void => {});
     }

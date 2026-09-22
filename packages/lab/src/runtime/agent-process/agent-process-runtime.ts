@@ -1,6 +1,9 @@
+import type { ConnectRequest } from '@enbox/connect';
 import type {
   AgentProcessChildActive,
   AgentProcessChildAwaitingSecret,
+  AgentProcessChildCommandFailure,
+  AgentProcessChildNoteWritePopupApproved,
   AgentProcessChildStopped,
 } from './agent-process-child-protocol.js';
 
@@ -12,6 +15,7 @@ import { dirname, extname, join } from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
 
 import {
+  AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES,
   AGENT_PROCESS_CHILD_MAX_LINE_BYTES,
   AGENT_PROCESS_PACKAGE_NAME,
   AGENT_PROCESS_PACKAGE_VERSION,
@@ -19,10 +23,18 @@ import {
   parseAgentProcessChildSecretCommand,
   parseAgentProcessChildStartCommand,
 } from './agent-process-child-protocol.js';
+import {
+  assertLabNoteWritePopupRequest,
+  cloneLabNoteWritePopupRequest,
+  fingerprintLabNoteWritePopupRequest,
+  LAB_NOTE_WRITE_MAX_APPROVALS,
+} from './note-write-approval.js';
 
 const CHILD_KILL_TIMEOUT_MS = 2_000;
 const CHILD_STOP_TIMEOUT_MS = 5_000;
 const CHILD_TERM_TIMEOUT_MS = 3_000;
+const APPROVAL_DRAIN_TIMEOUT_MS = 30_000;
+const APPROVAL_TIMEOUT_MS = 60_000;
 const RECORD_MAX_LINE_BYTES = 1_024;
 const START_TIMEOUT_MS = 30_000;
 
@@ -44,6 +56,7 @@ export type AgentProcessRuntimeOptions = Readonly<{
 }>;
 
 export type AgentProcessRuntimeDependencies = Readonly<{
+  approvalDrainTimeoutMs?: number;
   beforeChildStart?: () => Promise<void>;
   beforeSecretSubmit?: () => Promise<void>;
   beforeStopComplete?: () => Promise<void>;
@@ -53,6 +66,23 @@ export type AgentProcessRuntimeDependencies = Readonly<{
 export type AgentProcessStartParams = Readonly<{
   password: string;
 }>;
+
+export type AgentProcessNoteWritePopupApprovalParams = Readonly<{
+  dappOrigin: string;
+  request: ConnectRequest;
+}>;
+
+export type AgentProcessNoteWritePopupApproval = Readonly<{
+  idToken: string;
+}>;
+
+/** The ceremony may have committed remote effects; callers must reconcile instead of retrying. */
+export class AgentProcessApprovalOutcomeUnknownError extends Error {
+  public constructor() {
+    super('AgentProcessRuntime: note-write approval outcome is unknown; reconciliation is required');
+    this.name = 'AgentProcessApprovalOutcomeUnknownError';
+  }
+}
 
 export type AgentProcessRuntimeEvidence = Readonly<{
   actorGatewayUriTransport: 'stdin-ndjson';
@@ -133,8 +163,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function parseRecord(line: string, label: string): Record<string, unknown> {
-  if (line.length === 0 || Buffer.byteLength(line, 'utf8') > RECORD_MAX_LINE_BYTES) {
+function parseRecord(line: string, label: string, maximum = RECORD_MAX_LINE_BYTES): Record<string, unknown> {
+  if (line.length === 0 || Buffer.byteLength(line, 'utf8') > maximum) {
     throw new Error(`AgentProcessRuntime: invalid child ${label} record`);
   }
   let value: unknown;
@@ -147,6 +177,15 @@ function parseRecord(line: string, label: string): Record<string, unknown> {
     throw new Error(`AgentProcessRuntime: invalid child ${label} record`);
   }
   return value;
+}
+
+function compactJwe(value: unknown): value is string {
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES) {
+    return false;
+  }
+  const segments = value.split('.');
+  return segments.length === 5 && segments[0]!.length > 0 && segments[1] === '' &&
+    segments.slice(2).every((segment): boolean => /^[A-Za-z0-9_-]+$/u.test(segment));
 }
 
 function isCanonicalLoopbackOrigin(value: string): boolean {
@@ -213,6 +252,37 @@ export function parseAgentProcessStopped(line: string): AgentProcessChildStopped
   return { locked: true, type: 'stopped' };
 }
 
+function parseAgentCommandFailure(value: Record<string, unknown>, expectedId: string): AgentProcessChildCommandFailure {
+  const codes: AgentProcessChildCommandFailure['code'][] = [
+    'capacity-exceeded',
+    'invalid-request',
+    'outcome-unknown',
+    'reconciliation-required',
+    'replayed-request',
+  ];
+  if (!hasExactKeys(value, ['code', 'id', 'needsReconciliation', 'type']) ||
+    value.type !== 'agent-command-failed' || value.id !== expectedId ||
+    typeof value.code !== 'string' || !codes.includes(value.code as AgentProcessChildCommandFailure['code']) ||
+    typeof value.needsReconciliation !== 'boolean' || value.needsReconciliation !==
+      (value.code === 'outcome-unknown' || value.code === 'reconciliation-required')) {
+    throw new Error('AgentProcessRuntime: invalid child command failure record');
+  }
+  return value as AgentProcessChildCommandFailure;
+}
+
+function parseNoteWritePopupApproved(
+  line: string,
+  expectedId: string,
+): AgentProcessChildNoteWritePopupApproved | AgentProcessChildCommandFailure {
+  const value = parseRecord(line, 'note-write popup approval', AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES);
+  if (value.type === 'agent-command-failed') { return parseAgentCommandFailure(value, expectedId); }
+  if (!hasExactKeys(value, ['id', 'idToken', 'type']) || value.type !== 'note-write-popup-approved' ||
+    value.id !== expectedId || !compactJwe(value.idToken)) {
+    throw new Error('AgentProcessRuntime: invalid child note-write popup approval record');
+  }
+  return { id: expectedId, idToken: value.idToken, type: 'note-write-popup-approved' };
+}
+
 class BoundedLineReader {
   private readonly _bytes: number[] = [];
   private readonly _reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -222,7 +292,7 @@ class BoundedLineReader {
     this._reader = stream.getReader();
   }
 
-  public async readLine(timeoutMs: number): Promise<string> {
+  public async readLine(timeoutMs: number, maximumBytes = RECORD_MAX_LINE_BYTES): Promise<string> {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject): void => {
       timeoutId = setTimeout((): void => {
@@ -231,20 +301,26 @@ class BoundedLineReader {
       }, timeoutMs);
     });
     try {
-      return await Promise.race([this.readLineUnbounded(), timeout]);
+      return await Promise.race([this.readLineUnbounded(maximumBytes), timeout]);
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
-  private async readLineUnbounded(): Promise<string> {
+  private async readLineUnbounded(maximumBytes: number): Promise<string> {
     while (true) {
       const newlineIndex = this._bytes.indexOf(0x0a);
       if (newlineIndex !== -1) {
+        if (newlineIndex > maximumBytes) {
+          throw new Error('AgentProcessRuntime: child protocol record exceeded the line limit');
+        }
         const lineBytes = this._bytes.splice(0, newlineIndex + 1);
         lineBytes.pop();
         if (lineBytes.at(-1) === 0x0d) { lineBytes.pop(); }
         return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(lineBytes));
+      }
+      if (this._bytes.length > maximumBytes) {
+        throw new Error('AgentProcessRuntime: child protocol record exceeded the line limit');
       }
       if (this._ended) {
         throw new Error('AgentProcessRuntime: child stdout ended before the next protocol record');
@@ -259,7 +335,7 @@ class BoundedLineReader {
         }
         continue;
       }
-      if (this._bytes.length + result.value.byteLength > RECORD_MAX_LINE_BYTES) {
+      if (this._bytes.length + result.value.byteLength > maximumBytes) {
         throw new Error('AgentProcessRuntime: child protocol record exceeded the line limit');
       }
       this._bytes.push(...result.value);
@@ -291,6 +367,18 @@ async function waitForExit(child: AgentChildProcess, timeoutMs: number): Promise
   });
   try {
     return await Promise.race([child.exited.then((): true => true), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function waitForSettlement(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolvePromise): void => {
+    timeoutId = setTimeout((): void => { resolvePromise(false); }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise.then((): true => true, (): true => true), timeout]);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -333,10 +421,14 @@ export class AgentProcessRuntime {
   private readonly _beforeSecretSubmit: () => Promise<void>;
   private readonly _beforeStopComplete: () => Promise<void>;
   private readonly _childEntry: AgentChildEntry;
+  private readonly _approvalDrainTimeoutMs: number;
   private readonly _remoteDwnOrigin: string;
   private readonly _removeStorage: (directory: string) => Promise<void>;
+  private readonly _seenApprovalFingerprints = new Set<string>();
   private readonly _storageDirectory: string;
   private _active?: AgentProcessRuntimeEvidence;
+  private _approvalOutcomeUnknown = false;
+  private _approvalPromise?: Promise<AgentProcessNoteWritePopupApproval>;
   private _child?: AgentChildProcess;
   private _childExited = true;
   private _destroyPromise?: Promise<AgentProcessDestroyEvidence>;
@@ -359,6 +451,10 @@ export class AgentProcessRuntime {
     dependencies: AgentProcessRuntimeDependencies,
   ) {
     this.#actorGatewayUri = options.actorGatewayUri;
+    this._approvalDrainTimeoutMs = dependencies.approvalDrainTimeoutMs ?? APPROVAL_DRAIN_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this._approvalDrainTimeoutMs) || this._approvalDrainTimeoutMs <= 0) {
+      throw new RangeError('AgentProcessRuntime: approval drain timeout must be a positive safe integer');
+    }
     this._beforeChildStart = dependencies.beforeChildStart ?? (async (): Promise<void> => {});
     this._beforeSecretSubmit = dependencies.beforeSecretSubmit ?? (async (): Promise<void> => {});
     this._beforeStopComplete = dependencies.beforeStopComplete ?? (async (): Promise<void> => {});
@@ -440,6 +536,90 @@ export class AgentProcessRuntime {
     });
     this._startPromise = tracked;
     return tracked;
+  }
+
+  /**
+   * Runs the single allowlisted note-write popup ceremony and returns only its sealed response.
+   * The caller must first authenticate `dappOrigin`, kernel-open the request, and consume its consent handle.
+   */
+  public approveNoteWritePopup(
+    params: AgentProcessNoteWritePopupApprovalParams,
+  ): Promise<AgentProcessNoteWritePopupApproval> {
+    if (this._approvalPromise !== undefined) {
+      return Promise.reject(new Error('AgentProcessRuntime: an approval is already in progress'));
+    }
+    if (this._approvalOutcomeUnknown) {
+      return Promise.reject(new AgentProcessApprovalOutcomeUnknownError());
+    }
+    if (this._destroyRequested) {
+      return Promise.reject(new Error('AgentProcessRuntime: cannot approve after destroy()'));
+    }
+    if (this._stopping) {
+      return Promise.reject(new Error('AgentProcessRuntime: cannot approve while stop() is in progress'));
+    }
+    if (!this.active || this._active === undefined || this._child === undefined || this._lineReader === undefined) {
+      return Promise.reject(new Error('AgentProcessRuntime: agent child is not active'));
+    }
+
+    const approving = this.performNoteWritePopupApproval(params, this._active.agentDid, this._child, this._lineReader);
+    const tracked = approving.finally((): void => {
+      if (this._approvalPromise === tracked) { this._approvalPromise = undefined; }
+    });
+    this._approvalPromise = tracked;
+    return tracked;
+  }
+
+  private async performNoteWritePopupApproval(
+    params: AgentProcessNoteWritePopupApprovalParams,
+    providerDid: string,
+    child: AgentChildProcess,
+    lineReader: BoundedLineReader,
+  ): Promise<AgentProcessNoteWritePopupApproval> {
+    const request = cloneLabNoteWritePopupRequest(params.request);
+    assertLabNoteWritePopupRequest(request, providerDid, params.dappOrigin);
+    const fingerprint = await fingerprintLabNoteWritePopupRequest(request);
+    if (this._seenApprovalFingerprints.has(fingerprint)) {
+      throw new Error('AgentProcessRuntime: note-write popup request was already consumed');
+    }
+    if (this._seenApprovalFingerprints.size >= LAB_NOTE_WRITE_MAX_APPROVALS) {
+      throw new Error('AgentProcessRuntime: note-write approval capacity is exhausted; restart the agent process');
+    }
+
+    const id = crypto.randomUUID();
+    const line = `${JSON.stringify({
+      dappOrigin : params.dappOrigin,
+      id,
+      request,
+      type       : 'approve-note-write-popup',
+    })}\n`;
+    if (Buffer.byteLength(line, 'utf8') > AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES) {
+      throw new Error('AgentProcessRuntime: note-write popup command exceeded the active line limit');
+    }
+
+    // Consume before handing the request to the child. Transport ambiguity must never trigger an automatic retry.
+    this._seenApprovalFingerprints.add(fingerprint);
+    let response: AgentProcessChildNoteWritePopupApproved | AgentProcessChildCommandFailure;
+    try {
+      child.stdin.write(line);
+      await child.stdin.flush();
+      response = parseNoteWritePopupApproved(
+        await lineReader.readLine(APPROVAL_TIMEOUT_MS, AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES),
+        id,
+      );
+    } catch {
+      this._approvalOutcomeUnknown = true;
+      await this.terminateChild(false).catch((): void => {});
+      throw new AgentProcessApprovalOutcomeUnknownError();
+    }
+
+    if (response.type === 'agent-command-failed') {
+      if (response.needsReconciliation) {
+        this._approvalOutcomeUnknown = true;
+        throw new AgentProcessApprovalOutcomeUnknownError();
+      }
+      throw new Error(`AgentProcessRuntime: note-write popup approval rejected (${response.code})`);
+    }
+    return { idToken: response.idToken };
   }
 
   private async performStart(
@@ -610,10 +790,27 @@ export class AgentProcessRuntime {
       await this.terminateChild(false);
     }
     await starting?.catch((): void => {});
-    await this.terminateChild(true);
+    const approval = this._approvalPromise;
+    let approvalTimedOut = false;
+    if (approval !== undefined) {
+      if (await waitForSettlement(approval, this._approvalDrainTimeoutMs)) {
+        await approval.catch((): void => {});
+      } else {
+        approvalTimedOut = true;
+        this._approvalOutcomeUnknown = true;
+        await this.terminateChild(false);
+        await approval.catch((): void => {});
+      }
+    }
+    if (!approvalTimedOut) {
+      await this.terminateChild(true);
+    }
     await this._beforeStopComplete();
     if (!existsSync(this._storageDirectory)) {
       throw new Error('AgentProcessRuntime: durable storage disappeared during stop()');
+    }
+    if (this._approvalOutcomeUnknown) {
+      throw new AgentProcessApprovalOutcomeUnknownError();
     }
     return {
       ...(this._lastAgentDid === undefined ? {} : { agentDid: this._lastAgentDid }),
@@ -743,7 +940,15 @@ export class AgentProcessRuntime {
         await this.terminateChild(false);
         await starting.catch((): void => {});
       } else {
-        await this.terminateChild(true);
+        const approval = this._approvalPromise;
+        if (approval !== undefined && !await waitForSettlement(approval, this._approvalDrainTimeoutMs)) {
+          this._approvalOutcomeUnknown = true;
+          await this.terminateChild(false);
+          await approval.catch((): void => {});
+        } else {
+          await approval?.catch((): void => {});
+          await this.terminateChild(true);
+        }
       }
     } catch (error: unknown) {
       processError = error;
@@ -762,6 +967,7 @@ export class AgentProcessRuntime {
     }
     this._storageRemoved = true;
     if (processError !== undefined) { throw processError; }
+    if (this._approvalOutcomeUnknown) { throw new AgentProcessApprovalOutcomeUnknownError(); }
     return {
       processExited    : true,
       storageDirectory : this._storageDirectory,

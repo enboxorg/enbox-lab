@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 
 import {
+  AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES,
   AGENT_PROCESS_CHILD_MAX_LINE_BYTES,
+  parseAgentProcessChildActiveCommand,
   parseAgentProcessChildSecretCommand,
   parseAgentProcessChildStartCommand,
   parseAgentProcessChildStopCommand,
@@ -17,6 +19,7 @@ const ACTOR_GATEWAY_URI = 'http://127.0.0.1:3210/';
 const REMOTE_DWN_ORIGIN = 'http://127.0.0.1:4210';
 const STORAGE_DIRECTORY = '/tmp/enbox-lab-agent-protocol';
 const TEST_DID = `did:dht:${'y'.repeat(52)}`;
+const TEST_ID = '00000000-0000-4000-8000-000000000000';
 
 describe('agent child command protocol', () => {
   it('should accept only canonical immutable startup configuration', () => {
@@ -115,6 +118,32 @@ describe('agent child command protocol', () => {
     }
     expect(message.length).toBeGreaterThan(0);
     expect(message).not.toContain(secret);
+  });
+
+  it('should keep the larger active command surface exact and separate from secret framing', () => {
+    const active = JSON.stringify({
+      dappOrigin : 'http://localhost:44001',
+      id         : TEST_ID,
+      request    : { padding: 'x'.repeat(AGENT_PROCESS_CHILD_MAX_LINE_BYTES) },
+      type       : 'approve-note-write-popup',
+    });
+    expect(Buffer.byteLength(active, 'utf8')).toBeGreaterThan(AGENT_PROCESS_CHILD_MAX_LINE_BYTES);
+    expect(parseAgentProcessChildActiveCommand(active)).toMatchObject({
+      dappOrigin : 'http://localhost:44001',
+      id         : TEST_ID,
+      type       : 'approve-note-write-popup',
+    });
+    expect(parseAgentProcessChildActiveCommand('{"type":"stop"}')).toEqual({ type: 'stop' });
+
+    for (const invalid of [
+      JSON.stringify({ dappOrigin: 'http://localhost:44001', extra: true, id: TEST_ID, request: {}, type: 'approve-note-write-popup' }),
+      JSON.stringify({ dappOrigin: 'http://localhost:44001', id: 'not-a-uuid', request: {}, type: 'approve-note-write-popup' }),
+      JSON.stringify({ dappOrigin: 'http://localhost:44001', id: TEST_ID, request: [], type: 'approve-note-write-popup' }),
+      JSON.stringify({ dappOrigin: 'http://localhost:44001', id: TEST_ID, request: {}, type: 'sign' }),
+      'x'.repeat(AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES + 1),
+    ]) {
+      expect((): unknown => parseAgentProcessChildActiveCommand(invalid)).toThrow();
+    }
   });
 });
 

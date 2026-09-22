@@ -62,6 +62,7 @@ export const criticalCoverageFloors = {
   'src/proofs/docker-proof.ts'                                    : 95,
   'src/runtime/agent-process/agent-process-child-protocol.ts'     : 90,
   'src/runtime/agent-process/agent-process-runtime.ts'            : 90,
+  'src/runtime/agent-process/note-write-approval.ts'              : 90,
   'src/runtime/private-pkarr-testnet.ts'                          : 80,
 } as const;
 
