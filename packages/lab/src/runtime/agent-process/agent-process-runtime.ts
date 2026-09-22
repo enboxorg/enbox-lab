@@ -4,6 +4,7 @@ import type {
   AgentProcessChildAwaitingSecret,
   AgentProcessChildCommandFailure,
   AgentProcessChildNoteWritePopupApproved,
+  AgentProcessChildNoteWriteRelayApproved,
   AgentProcessChildStopped,
 } from './agent-process-child-protocol.js';
 
@@ -25,8 +26,11 @@ import {
 } from './agent-process-child-protocol.js';
 import {
   assertLabNoteWritePopupRequest,
+  assertLabNoteWriteRelayRequest,
   cloneLabNoteWritePopupRequest,
+  cloneLabNoteWriteRequest,
   fingerprintLabNoteWritePopupRequest,
+  fingerprintLabNoteWriteRequest,
   LAB_NOTE_WRITE_MAX_APPROVALS,
 } from './note-write-approval.js';
 
@@ -73,6 +77,17 @@ export type AgentProcessNoteWritePopupApprovalParams = Readonly<{
 }>;
 
 export type AgentProcessNoteWritePopupApproval = Readonly<{
+  idToken: string;
+}>;
+
+export type AgentProcessNoteWriteRelayApprovalParams = Readonly<{
+  dappOrigin: string;
+  pin: string;
+  relayOrigin: string;
+  request: ConnectRequest;
+}>;
+
+export type AgentProcessNoteWriteRelayApproval = Readonly<{
   idToken: string;
 }>;
 
@@ -281,6 +296,19 @@ function parseNoteWritePopupApproved(
     throw new Error('AgentProcessRuntime: invalid child note-write popup approval record');
   }
   return { id: expectedId, idToken: value.idToken, type: 'note-write-popup-approved' };
+}
+
+function parseNoteWriteRelayApproved(
+  line: string,
+  expectedId: string,
+): AgentProcessChildNoteWriteRelayApproved | AgentProcessChildCommandFailure {
+  const value = parseRecord(line, 'note-write relay approval', AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES);
+  if (value.type === 'agent-command-failed') { return parseAgentCommandFailure(value, expectedId); }
+  if (!hasExactKeys(value, ['id', 'idToken', 'type']) || value.type !== 'note-write-relay-approved' ||
+    value.id !== expectedId || !compactJwe(value.idToken)) {
+    throw new Error('AgentProcessRuntime: invalid child note-write relay approval record');
+  }
+  return { id: expectedId, idToken: value.idToken, type: 'note-write-relay-approved' };
 }
 
 class BoundedLineReader {
@@ -545,28 +573,8 @@ export class AgentProcessRuntime {
   public approveNoteWritePopup(
     params: AgentProcessNoteWritePopupApprovalParams,
   ): Promise<AgentProcessNoteWritePopupApproval> {
-    if (this._approvalPromise !== undefined) {
-      return Promise.reject(new Error('AgentProcessRuntime: an approval is already in progress'));
-    }
-    if (this._approvalOutcomeUnknown) {
-      return Promise.reject(new AgentProcessApprovalOutcomeUnknownError());
-    }
-    if (this._destroyRequested) {
-      return Promise.reject(new Error('AgentProcessRuntime: cannot approve after destroy()'));
-    }
-    if (this._stopping) {
-      return Promise.reject(new Error('AgentProcessRuntime: cannot approve while stop() is in progress'));
-    }
-    if (!this.active || this._active === undefined || this._child === undefined || this._lineReader === undefined) {
-      return Promise.reject(new Error('AgentProcessRuntime: agent child is not active'));
-    }
-
-    const approving = this.performNoteWritePopupApproval(params, this._active.agentDid, this._child, this._lineReader);
-    const tracked = approving.finally((): void => {
-      if (this._approvalPromise === tracked) { this._approvalPromise = undefined; }
-    });
-    this._approvalPromise = tracked;
-    return tracked;
+    return this.startApproval((providerDid, child, lineReader): Promise<AgentProcessNoteWritePopupApproval> =>
+      this.performNoteWritePopupApproval(params, providerDid, child, lineReader));
   }
 
   private async performNoteWritePopupApproval(
@@ -618,6 +626,102 @@ export class AgentProcessRuntime {
         throw new AgentProcessApprovalOutcomeUnknownError();
       }
       throw new Error(`AgentProcessRuntime: note-write popup approval rejected (${response.code})`);
+    }
+    return { idToken: response.idToken };
+  }
+
+  /** Runs the allowlisted note-write relay ceremony and PIN-seals its response. */
+  public approveNoteWriteRelay(
+    params: AgentProcessNoteWriteRelayApprovalParams,
+  ): Promise<AgentProcessNoteWriteRelayApproval> {
+    return this.startApproval((providerDid, child, lineReader): Promise<AgentProcessNoteWriteRelayApproval> =>
+      this.performNoteWriteRelayApproval(params, providerDid, child, lineReader));
+  }
+
+  private startApproval(
+    operation: (
+      providerDid: string,
+      child: AgentChildProcess,
+      lineReader: BoundedLineReader,
+    ) => Promise<AgentProcessNoteWritePopupApproval>,
+  ): Promise<AgentProcessNoteWritePopupApproval> {
+    if (this._approvalPromise !== undefined) {
+      return Promise.reject(new Error('AgentProcessRuntime: an approval is already in progress'));
+    }
+    if (this._approvalOutcomeUnknown) {
+      return Promise.reject(new AgentProcessApprovalOutcomeUnknownError());
+    }
+    if (this._destroyRequested) {
+      return Promise.reject(new Error('AgentProcessRuntime: cannot approve after destroy()'));
+    }
+    if (this._stopping) {
+      return Promise.reject(new Error('AgentProcessRuntime: cannot approve while stop() is in progress'));
+    }
+    if (!this.active || this._active === undefined || this._child === undefined || this._lineReader === undefined) {
+      return Promise.reject(new Error('AgentProcessRuntime: agent child is not active'));
+    }
+
+    const approving = operation(this._active.agentDid, this._child, this._lineReader);
+    const tracked = approving.finally((): void => {
+      if (this._approvalPromise === tracked) { this._approvalPromise = undefined; }
+    });
+    this._approvalPromise = tracked;
+    return tracked;
+  }
+
+  private async performNoteWriteRelayApproval(
+    params: AgentProcessNoteWriteRelayApprovalParams,
+    providerDid: string,
+    child: AgentChildProcess,
+    lineReader: BoundedLineReader,
+  ): Promise<AgentProcessNoteWriteRelayApproval> {
+    const request = cloneLabNoteWriteRequest(params.request);
+    assertLabNoteWriteRelayRequest(request, providerDid, params.dappOrigin, params.relayOrigin);
+    if (!/^\d{4}$/u.test(params.pin)) {
+      throw new Error('AgentProcessRuntime: relay approval PIN must contain exactly four digits');
+    }
+    const fingerprint = await fingerprintLabNoteWriteRequest(request);
+    if (this._seenApprovalFingerprints.has(fingerprint)) {
+      throw new Error('AgentProcessRuntime: note-write relay request was already consumed');
+    }
+    if (this._seenApprovalFingerprints.size >= LAB_NOTE_WRITE_MAX_APPROVALS) {
+      throw new Error('AgentProcessRuntime: note-write approval capacity is exhausted; restart the agent process');
+    }
+
+    const id = crypto.randomUUID();
+    const line = `${JSON.stringify({
+      dappOrigin  : params.dappOrigin,
+      id,
+      pin         : params.pin,
+      relayOrigin : params.relayOrigin,
+      request,
+      type        : 'approve-note-write-relay',
+    })}\n`;
+    if (Buffer.byteLength(line, 'utf8') > AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES) {
+      throw new Error('AgentProcessRuntime: note-write relay command exceeded the active line limit');
+    }
+
+    this._seenApprovalFingerprints.add(fingerprint);
+    let response: AgentProcessChildNoteWriteRelayApproved | AgentProcessChildCommandFailure;
+    try {
+      child.stdin.write(line);
+      await child.stdin.flush();
+      response = parseNoteWriteRelayApproved(
+        await lineReader.readLine(APPROVAL_TIMEOUT_MS, AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES),
+        id,
+      );
+    } catch {
+      this._approvalOutcomeUnknown = true;
+      await this.terminateChild(false).catch((): void => {});
+      throw new AgentProcessApprovalOutcomeUnknownError();
+    }
+
+    if (response.type === 'agent-command-failed') {
+      if (response.needsReconciliation) {
+        this._approvalOutcomeUnknown = true;
+        throw new AgentProcessApprovalOutcomeUnknownError();
+      }
+      throw new Error(`AgentProcessRuntime: note-write relay approval rejected (${response.code})`);
     }
     return { idToken: response.idToken };
   }

@@ -3,10 +3,12 @@ import type { ConnectWorkerSessionHandle } from '../proofs/connect/connect-worke
 import type {
   AgentProcessNoteWritePopupApproval,
   AgentProcessNoteWritePopupApprovalParams,
+  AgentProcessNoteWriteRelayApproval,
+  AgentProcessNoteWriteRelayApprovalParams,
 } from './agent-process/agent-process-runtime.js';
 
 import { AgentProcessApprovalOutcomeUnknownError } from './agent-process/agent-process-runtime.js';
-import { assertLabNoteWriteDappOrigin } from './agent-process/note-write-approval.js';
+import { assertLabNoteWriteDappOrigin, assertLabNoteWriteRelayOrigin } from './agent-process/note-write-approval.js';
 
 import { ConnectWorkerBoundaryError, ConnectWorkerSessionRegistry } from '../proofs/connect/connect-worker-boundary.js';
 
@@ -15,6 +17,9 @@ export const POPUP_APPROVAL_APPROVE_PATH = '/__lab/connect/popup/approve';
 export const POPUP_APPROVAL_CANCEL_PATH = '/__lab/connect/popup/cancel';
 export const POPUP_APPROVAL_SESSION_HEADER = 'x-enbox-lab-session';
 export const POPUP_APPROVAL_MAX_BODY_BYTES = 65_536;
+export const RELAY_APPROVAL_BIND_PATH = '/__lab/connect/relay/bind';
+export const RELAY_APPROVAL_APPROVE_PATH = '/__lab/connect/relay/approve';
+export const RELAY_APPROVAL_CANCEL_PATH = '/__lab/connect/relay/cancel';
 const POPUP_APPROVAL_MAX_COMPLETED_RESULTS = 64;
 const POPUP_APPROVAL_STOP_TIMEOUT_MS = 65_000;
 
@@ -22,17 +27,21 @@ type PopupApprovalAgent = {
   approveNoteWritePopup(params: AgentProcessNoteWritePopupApprovalParams): Promise<AgentProcessNoteWritePopupApproval>;
 };
 
+type RelayApprovalAgent = {
+  approveNoteWriteRelay(params: AgentProcessNoteWriteRelayApprovalParams): Promise<AgentProcessNoteWriteRelayApproval>;
+};
+
 type CompletedApproval = Readonly<{
   expiresAt: number;
-  outcome: PopupApprovalOutcome;
+  outcome: ApprovalOutcome;
 }>;
 
 type PendingApproval = Readonly<{
   expiresAt: number;
-  promise: Promise<PopupApprovalOutcome>;
+  promise: Promise<ApprovalOutcome>;
 }>;
 
-type PopupApprovalOutcome =
+type ApprovalOutcome =
   | Readonly<{ idToken: string; ok: true }>
   | Readonly<{ code: 'approval-failed' | 'reconciliation-required'; ok: false }>;
 
@@ -48,6 +57,22 @@ export type PopupApprovalBridgeBootstrap = Readonly<{
 export type PopupApprovalBridgeOptions = Readonly<{
   agent: PopupApprovalAgent;
   dappOrigin: string;
+  walletOrigin: string;
+}>;
+
+export type RelayApprovalBridgeBootstrap = Readonly<{
+  approvePath: typeof RELAY_APPROVAL_APPROVE_PATH;
+  bindPath: typeof RELAY_APPROVAL_BIND_PATH;
+  cancelPath: typeof RELAY_APPROVAL_CANCEL_PATH;
+  sessionCapability: string;
+  sessionHeader: typeof POPUP_APPROVAL_SESSION_HEADER;
+  walletOrigin: string;
+}>;
+
+export type RelayApprovalBridgeOptions = Readonly<{
+  agent: RelayApprovalAgent;
+  dappOrigin: string;
+  relayOrigin: string;
   walletOrigin: string;
 }>;
 
@@ -327,7 +352,7 @@ export class PopupApprovalBridge {
     return this.outcomeResponse(outcome);
   }
 
-  private async runApproval(request: ConnectRequest): Promise<PopupApprovalOutcome> {
+  private async runApproval(request: ConnectRequest): Promise<ApprovalOutcome> {
     try {
       const { idToken } = await this._agent.approveNoteWritePopup({
         dappOrigin: this._dappOrigin,
@@ -345,7 +370,7 @@ export class PopupApprovalBridge {
     }
   }
 
-  private outcomeResponse(outcome: PopupApprovalOutcome): Response {
+  private outcomeResponse(outcome: ApprovalOutcome): Response {
     return outcome.ok
       ? jsonResponse({ ok: true, result: { idToken: outcome.idToken } })
       : failureResponse(outcome.code, outcome.code === 'reconciliation-required' ? 409 : 502);
@@ -361,6 +386,204 @@ export class PopupApprovalBridge {
   private async performStop(): Promise<void> {
     if (!await waitForApprovals([...this._pending.values()].map(({ promise }) => promise))) {
       throw new Error('PopupApprovalBridge: timed out draining active approvals');
+    }
+    this._pending.clear();
+    this._completed.clear();
+  }
+}
+
+/** Same-origin bridge for one direct-post relay request and its four-digit pairing code. */
+export class RelayApprovalBridge {
+  #sessionCapability: string;
+
+  private readonly _agent: RelayApprovalAgent;
+  private readonly _completed = new Map<string, CompletedApproval>();
+  private readonly _context: Readonly<{ principalId: string }>;
+  private readonly _dappOrigin: string;
+  private readonly _pending = new Map<string, PendingApproval>();
+  private readonly _registry = new ConnectWorkerSessionRegistry();
+  private readonly _relayOrigin: string;
+  private readonly _walletOrigin: string;
+  private _stopPromise?: Promise<void>;
+  private _stopped = false;
+
+  public constructor(options: RelayApprovalBridgeOptions) {
+    this._agent = options.agent;
+    assertLabNoteWriteDappOrigin(options.dappOrigin);
+    assertLabNoteWriteRelayOrigin(options.relayOrigin);
+    this._dappOrigin = options.dappOrigin;
+    this._relayOrigin = options.relayOrigin;
+    this._walletOrigin = canonicalWalletOrigin(options.walletOrigin);
+    if (this._dappOrigin === this._walletOrigin) {
+      throw new Error('RelayApprovalBridge: dapp and wallet origins must be distinct');
+    }
+    this.#sessionCapability = [...crypto.getRandomValues(new Uint8Array(32))]
+      .map((byte): string => byte.toString(16).padStart(2, '0'))
+      .join('');
+    this._context = Object.freeze({ principalId: crypto.randomUUID() });
+  }
+
+  public get walletOrigin(): string { return this._walletOrigin; }
+
+  /** Returns the wallet-origin bootstrap without placing its capability in a URL. */
+  public bootstrap(): RelayApprovalBridgeBootstrap {
+    if (this._stopped) { throw new Error('RelayApprovalBridge: bridge is stopped'); }
+    return Object.freeze({
+      approvePath       : RELAY_APPROVAL_APPROVE_PATH,
+      bindPath          : RELAY_APPROVAL_BIND_PATH,
+      cancelPath        : RELAY_APPROVAL_CANCEL_PATH,
+      sessionCapability : this.#sessionCapability,
+      sessionHeader     : POPUP_APPROVAL_SESSION_HEADER,
+      walletOrigin      : this._walletOrigin,
+    });
+  }
+
+  public toJSON(): Readonly<{ stopped: boolean; walletOrigin: string }> {
+    return { stopped: this._stopped, walletOrigin: this._walletOrigin };
+  }
+
+  /** Handles the exact authenticated bind, approve, and cancel routes. */
+  public async handle(request: Request): Promise<Response> {
+    const path = requestPath(request, this._walletOrigin);
+    if (this._stopped || request.method !== 'POST' || path === undefined ||
+      (path !== RELAY_APPROVAL_BIND_PATH && path !== RELAY_APPROVAL_APPROVE_PATH &&
+        path !== RELAY_APPROVAL_CANCEL_PATH) ||
+      request.headers.get('origin') !== this._walletOrigin ||
+      request.headers.get('sec-fetch-site') !== 'same-origin' ||
+      request.headers.get(POPUP_APPROVAL_SESSION_HEADER) !== this.#sessionCapability) {
+      await request.body?.cancel().catch((): void => {});
+      return hiddenResponse();
+    }
+
+    let body: unknown;
+    try {
+      body = await readBoundedJson(request);
+    } catch {
+      return failureResponse('invalid-request', 400);
+    }
+    try {
+      if (path === RELAY_APPROVAL_BIND_PATH) { return this.bind(body); }
+      if (path === RELAY_APPROVAL_CANCEL_PATH) { return this.cancel(body); }
+      return await this.approve(body);
+    } catch (error: unknown) {
+      if (error instanceof ConnectWorkerBoundaryError) {
+        return failureResponse(error.code, error.code === 'invalid-session' ? 409 : 400);
+      }
+      return failureResponse('invalid-request', 400);
+    }
+  }
+
+  /** Stops admission, drains active approval, and forgets every sealed response. */
+  public stop(): Promise<void> {
+    if (this._stopPromise === undefined) {
+      if (!this._stopped) {
+        this._stopped = true;
+        this._registry.stop();
+        this.#sessionCapability = '';
+      }
+      const stopping = this.performStop();
+      const tracked = stopping.catch((error: unknown): never => {
+        if (this._stopPromise === tracked) { this._stopPromise = undefined; }
+        throw error;
+      });
+      this._stopPromise = tracked;
+    }
+    return this._stopPromise;
+  }
+
+  private bind(body: unknown): Response {
+    if (!isRecord(body) || !hasExactKeys(body, ['request', 'requestUri']) ||
+      !isRecord(body.request) || typeof body.requestUri !== 'string') {
+      return failureResponse('invalid-request', 400);
+    }
+    this.pruneCompleted();
+    if (this._completed.size + this._pending.size >= POPUP_APPROVAL_MAX_COMPLETED_RESULTS) {
+      return failureResponse('capacity-exceeded', 429);
+    }
+    const bound = this._registry.bind({
+      channel   : { kind: 'relay', requestUri: body.requestUri },
+      context   : this._context,
+      request   : body.request as ConnectRequest,
+      transport : 'relay',
+    });
+    if (new URL(body.requestUri).origin !== this._relayOrigin) {
+      this._registry.cancel(this._context, bound.handle);
+      return failureResponse('invalid-channel', 400);
+    }
+    return jsonResponse({ ok: true, result: bound });
+  }
+
+  private cancel(body: unknown): Response {
+    if (!isRecord(body) || !hasExactKeys(body, ['handle'])) {
+      return failureResponse('invalid-request', 400);
+    }
+    this._registry.cancel(this._context, parseHandle(body.handle));
+    return new Response(null, { headers: secureHeaders(), status: 204 });
+  }
+
+  private async approve(body: unknown): Promise<Response> {
+    if (!isRecord(body) || !hasExactKeys(body, ['handle', 'pin']) || !/^\d{4}$/u.test(String(body.pin)) ||
+      typeof body.pin !== 'string') {
+      return failureResponse('invalid-request', 400);
+    }
+    const handle = parseHandle(body.handle);
+    this.pruneCompleted();
+    const completed = this._completed.get(handle.id);
+    if (completed !== undefined && completed.expiresAt === handle.expiresAt) {
+      return this.outcomeResponse(completed.outcome);
+    }
+    const pending = this._pending.get(handle.id);
+    if (pending !== undefined && pending.expiresAt === handle.expiresAt) {
+      return this.outcomeResponse(await pending.promise);
+    }
+
+    const claimed = this._registry.claimForApproval(this._context, handle);
+    const promise = this.runApproval(claimed.request, body.pin);
+    this._pending.set(handle.id, { expiresAt: handle.expiresAt, promise });
+    const outcome = await promise;
+    this._pending.delete(handle.id);
+    if (!this._stopped) {
+      this._completed.set(handle.id, { expiresAt: handle.expiresAt, outcome });
+    }
+    return this.outcomeResponse(outcome);
+  }
+
+  private async runApproval(request: ConnectRequest, pin: string): Promise<ApprovalOutcome> {
+    try {
+      const { idToken } = await this._agent.approveNoteWriteRelay({
+        dappOrigin  : this._dappOrigin,
+        pin,
+        relayOrigin : this._relayOrigin,
+        request,
+      });
+      if (!validOpaqueIdToken(idToken)) { return { code: 'reconciliation-required', ok: false }; }
+      return { idToken, ok: true };
+    } catch (error: unknown) {
+      return {
+        code: error instanceof AgentProcessApprovalOutcomeUnknownError
+          ? 'reconciliation-required'
+          : 'approval-failed',
+        ok: false,
+      };
+    }
+  }
+
+  private outcomeResponse(outcome: ApprovalOutcome): Response {
+    return outcome.ok
+      ? jsonResponse({ ok: true, result: { idToken: outcome.idToken } })
+      : failureResponse(outcome.code, outcome.code === 'reconciliation-required' ? 409 : 502);
+  }
+
+  private pruneCompleted(): void {
+    const now = Date.now();
+    for (const [id, completed] of this._completed) {
+      if (now >= completed.expiresAt) { this._completed.delete(id); }
+    }
+  }
+
+  private async performStop(): Promise<void> {
+    if (!await waitForApprovals([...this._pending.values()].map(({ promise }) => promise))) {
+      throw new Error('RelayApprovalBridge: timed out draining active approvals');
     }
     this._pending.clear();
     this._completed.clear();

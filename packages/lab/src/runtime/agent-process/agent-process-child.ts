@@ -1,14 +1,16 @@
-import type { ConnectRequest } from '@enbox/connect';
 import type {
   AgentProcessChildApproveNoteWritePopupCommand,
+  AgentProcessChildApproveNoteWriteRelayCommand,
   AgentProcessChildCommandFailure,
   AgentProcessChildNoteWritePopupApproved,
+  AgentProcessChildNoteWriteRelayApproved,
 } from './agent-process-child-protocol.js';
 import type {
   ConnectApprovalProgressPhase,
   ConnectApprovalResult,
   EnboxUserAgent as EnboxUserAgentType,
 } from '@enbox/agent';
+import type { ConnectRequest, ConnectSessionTransport } from '@enbox/connect';
 
 import { ConnectProvider } from '@enbox/connect';
 import { fileURLToPath } from 'node:url';
@@ -29,8 +31,11 @@ import {
 } from './agent-process-child-protocol.js';
 import {
   assertLabNoteWritePopupRequest,
+  assertLabNoteWriteRelayRequest,
   cloneLabNoteWritePopupRequest,
+  cloneLabNoteWriteRequest,
   fingerprintLabNoteWritePopupRequest,
+  fingerprintLabNoteWriteRequest,
   LAB_NOTE_WRITE_APP_NAME,
   LAB_NOTE_WRITE_MAX_APPROVALS,
   LAB_NOTE_WRITE_PERMISSION_REQUEST,
@@ -232,6 +237,8 @@ async function activateWithOneUseSecret(
 async function executeAndSealNoteWriteApproval(
   agent: EnboxUserAgentType,
   request: ConnectRequest,
+  transport: ConnectSessionTransport,
+  pin?: string,
 ): Promise<string> {
   const phases: ConnectApprovalProgressPhase[] = [];
   const result = await executeConnectApproval({
@@ -241,15 +248,16 @@ async function executeAndSealNoteWriteApproval(
     onProgress                : ({ phase }): void => { phases.push(phase); },
     providerDid               : agent.agentDid.uri,
     request,
-    transport                 : 'postMessage',
+    transport,
   });
-  assertNoteWriteApprovalResult(result, request, phases, agent.agentDid.uri);
+  assertNoteWriteApprovalResult(result, request, phases, agent.agentDid.uri, transport);
   const { responseSigner, ...approval } = result;
   return ConnectProvider.sealApprovedResponse({
     approval,
     providerDid : agent.agentDid.uri,
     request,
     signer      : responseSigner,
+    ...(pin === undefined ? {} : { pin }),
   });
 }
 
@@ -258,6 +266,7 @@ function assertNoteWriteApprovalResult(
   request: ConnectRequest,
   phases: readonly ConnectApprovalProgressPhase[],
   providerDid: string,
+  transport: ConnectSessionTransport,
 ): void {
   if (result.delegateGrants.length !== 2 || result.sessionRevocations.length !== 1 ||
     result.delegatePortableDid?.uri !== result.delegateDid || result.responseSigner.uri !== result.delegateDid ||
@@ -282,7 +291,7 @@ function assertNoteWriteApprovalResult(
     sessionGrant.delegated !== true ||
     !isDeepStrictEqual(sessionGrant.scope, LAB_NOTE_WRITE_PERMISSION_REQUEST.permissionScopes[0]) ||
     session.appName !== LAB_NOTE_WRITE_APP_NAME || session.origin !== metadata.origin ||
-    session.transport !== 'postMessage' || session.expiresAt !== sessionGrant.dateExpires ||
+    session.transport !== transport || session.expiresAt !== sessionGrant.dateExpires ||
     session.appIcon !== undefined || session.applicationId !== undefined ||
     session.userAgent !== metadata.userAgent || session.platform !== metadata.platform ||
     session.language !== metadata.language || !isDeepStrictEqual(session.languages, metadata.languages) ||
@@ -331,8 +340,41 @@ async function approveNoteWritePopupRequest(
   // Consume before the first side effect. Every later failure is outcome-unknown and cannot be retried.
   seen.add(fingerprint);
   try {
-    const idToken = await executeAndSealNoteWriteApproval(agent, request);
+    const idToken = await executeAndSealNoteWriteApproval(agent, request, 'postMessage');
     return { id: command.id, idToken, type: 'note-write-popup-approved' };
+  } catch {
+    return commandFailure(command.id, 'outcome-unknown', true);
+  }
+}
+
+async function approveNoteWriteRelayRequest(
+  command: AgentProcessChildApproveNoteWriteRelayCommand,
+  agent: EnboxUserAgentType,
+  seen: Set<string>,
+  reconciliationRequired: boolean,
+): Promise<AgentProcessChildNoteWriteRelayApproved | AgentProcessChildCommandFailure> {
+  if (reconciliationRequired) {
+    return commandFailure(command.id, 'reconciliation-required', true);
+  }
+  let request: ConnectRequest;
+  try {
+    request = cloneLabNoteWriteRequest(command.request);
+    assertLabNoteWriteRelayRequest(request, agent.agentDid.uri, command.dappOrigin, command.relayOrigin);
+  } catch {
+    return commandFailure(command.id, 'invalid-request', false);
+  }
+  const fingerprint = await fingerprintLabNoteWriteRequest(request);
+  if (seen.has(fingerprint)) {
+    return commandFailure(command.id, 'replayed-request', false);
+  }
+  if (seen.size >= LAB_NOTE_WRITE_MAX_APPROVALS) {
+    return commandFailure(command.id, 'capacity-exceeded', false);
+  }
+
+  seen.add(fingerprint);
+  try {
+    const idToken = await executeAndSealNoteWriteApproval(agent, request, 'relay', command.pin);
+    return { id: command.id, idToken, type: 'note-write-relay-approved' };
   } catch {
     return commandFailure(command.id, 'outcome-unknown', true);
   }
@@ -411,7 +453,9 @@ async function runChild(): Promise<void> {
       const command = parseAgentProcessChildActiveCommand(line);
       if (command.type === 'stop') { break; }
 
-      const result = await approveNoteWritePopupRequest(command, agent, seen, reconciliationRequired);
+      const result = command.type === 'approve-note-write-popup'
+        ? await approveNoteWritePopupRequest(command, agent, seen, reconciliationRequired)
+        : await approveNoteWriteRelayRequest(command, agent, seen, reconciliationRequired);
       if (result.type === 'agent-command-failed' && result.needsReconciliation) {
         reconciliationRequired = true;
       }

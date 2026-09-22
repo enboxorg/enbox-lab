@@ -1,5 +1,6 @@
 import { ConnectWorkerSessionRegistry } from '../../src/proofs/connect/connect-worker-boundary.js';
 import { createTestNoteWritePopupRequest } from './test-note-write-popup.js';
+import { createTestNoteWriteRelayRequest } from './test-note-write-relay.js';
 import { DidServerRuntime } from '../../src/proofs/did-server/did-server-runtime.js';
 import { DwnPermissionGrant } from '@enbox/agent';
 import { existsSync } from 'node:fs';
@@ -26,7 +27,7 @@ function deferred(): Readonly<{ promise: Promise<void>; resolve(): void }> {
   return { promise, resolve };
 }
 
-describe('process-backed note-write popup approval', () => {
+describe('process-backed note-write approval', () => {
   it('should execute, seal, and app-open one exact real approval without exporting plaintext keys', async () => {
     const gateway = await startTestPkarrGateway('popup-approval');
     const registry = new ConnectWorkerSessionRegistry();
@@ -151,6 +152,68 @@ describe('process-backed note-write popup approval', () => {
       expect(existsSync(runtime.storageDirectory)).toBe(true);
     } finally {
       registry.stop();
+      await runtime?.destroy().catch((): void => {});
+      await server?.stop().catch((): void => {});
+      await gateway.close();
+    }
+  }, 90_000);
+
+  it('should PIN-seal the exact direct-post approval and reject replay', async () => {
+    const gateway = await startTestPkarrGateway('relay-approval');
+    const pin = '4821';
+    let runtime: AgentProcessRuntime | undefined;
+    let server: DidServerRuntime | undefined;
+    try {
+      server = await DidServerRuntime.create(gateway.resolverEndpoint);
+      runtime = await AgentProcessRuntime.create({
+        actorGatewayUri : gateway.endpoint,
+        remoteDwnOrigin : server.origin,
+      });
+      await server.start();
+      const initialized = await runtime.start({ password: 'relay-approval-password-never-log' });
+      const fixture = await createTestNoteWriteRelayRequest();
+      const approval = await runtime.approveNoteWriteRelay({
+        dappOrigin  : fixture.dappOrigin,
+        pin,
+        relayOrigin : fixture.relayOrigin,
+        request     : fixture.request,
+      });
+      await expect(openResponse({
+        expected: {
+          clientDid   : fixture.clientDid,
+          nonce       : fixture.nonce,
+          providerDid : initialized.agentDid,
+          state       : fixture.state,
+        },
+        jwe                 : approval.idToken,
+        pin                 : '0000',
+        recipientPrivateKey : fixture.responsePrivateKey,
+      })).rejects.toThrow();
+      const response = await openResponse({
+        expected: {
+          clientDid   : fixture.clientDid,
+          nonce       : fixture.nonce,
+          providerDid : initialized.agentDid,
+          state       : fixture.state,
+        },
+        jwe                 : approval.idToken,
+        pin,
+        recipientPrivateKey : fixture.responsePrivateKey,
+      });
+      const sessionGrant = response.delegateGrants
+        .map((message) => DwnPermissionGrant.parse(message))
+        .find((grant): boolean => grant.scope.protocol === LAB_NOTE_WRITE_PROTOCOL_URI);
+      expect(sessionGrant?.connectSession).toMatchObject({
+        origin    : fixture.dappOrigin,
+        transport : 'relay',
+      });
+      await expect(runtime.approveNoteWriteRelay({
+        dappOrigin  : fixture.dappOrigin,
+        pin,
+        relayOrigin : fixture.relayOrigin,
+        request     : fixture.request,
+      })).rejects.toThrow('already consumed');
+    } finally {
       await runtime?.destroy().catch((): void => {});
       await server?.stop().catch((): void => {});
       await gateway.close();
