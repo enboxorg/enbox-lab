@@ -33,6 +33,7 @@ end_of_record
   });
 
   it('should keep browser and agent-process boundaries on critical coverage floors', () => {
+    expect(criticalCoverageFloors['src/proofs/connect/approved-popup-browser-proof.ts']).toBe(20);
     expect(criticalCoverageFloors['src/proofs/did-browser/did-browser-runtime.ts']).toBe(20);
     expect(criticalCoverageFloors['src/proofs/did-browser/fixture/did-service-worker-protocol.ts']).toBe(85);
     expect(criticalCoverageFloors['src/runtime/agent-process/agent-process-child-protocol.ts']).toBe(90);

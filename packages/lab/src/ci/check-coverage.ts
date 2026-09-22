@@ -49,6 +49,7 @@ export const criticalCoverageFloors = {
   'src/pkarr-publication-journal.ts'                              : 95,
   'src/pkarr-publication-server.ts'                               : 90,
   'src/proof-result.ts'                                           : 95,
+  'src/proofs/connect/approved-popup-browser-proof.ts'            : 20,
   'src/proofs/connect/connect-browser-proof.ts'                   : 95,
   'src/proofs/connect/connect-relay-runtime.ts'                   : 95,
   'src/proofs/connect/connect-worker-boundary.ts'                 : 95,

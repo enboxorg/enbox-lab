@@ -5,6 +5,7 @@ import type { LabCheckStatus, LabProofReport } from '../proof-result.js';
 import { resolve } from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
 
+import { runApprovedPopupBrowserProof } from '../proofs/connect/approved-popup-browser-proof.js';
 import { runCatalogPreflight } from '../catalog/catalog-preflight.js';
 import { runConnectBrowserProof } from '../proofs/connect/connect-browser-proof.js';
 import { runDidRuntimeProof } from '../proofs/did-runtime/did-runtime-proof.js';
@@ -44,6 +45,23 @@ Runs the real Linux proof suite and verifies its exact pass/unsupported contract
 `;
 
 export const linuxProofContracts = {
+  approvedPopup: {
+    pass: [
+      'A06-browser-popup-private-testnet',
+      'A13-browser-popup-approval',
+      'A13-browser-popup-approval-bridge',
+      'A10-browser-popup-private-did-runtime',
+      'browser-popup-approval-cleanup',
+    ],
+    proof       : 'p0-browser-popup-approval',
+    unsupported : [
+      'A13-controller-wallet-session-provisioning',
+      'A13-relay-pin-approved-response',
+      'A16-user-identity-selection',
+      'A18-encrypted-private-note-authorization',
+      'A14-delegated-session-lifecycle',
+    ],
+  },
   browserConnect: {
     pass: [
       'A13-browser-popup-denial-subcheck',
@@ -313,6 +331,12 @@ async function run(options: CliOptions): Promise<number> {
     evidenceDirectory : options.evidenceDirectory,
     filename          : 'browser-connect-denial.json',
     run               : runConnectBrowserProof,
+  }));
+  entries.push(await runEvidence({
+    contract          : linuxProofContracts.approvedPopup,
+    evidenceDirectory : options.evidenceDirectory,
+    filename          : 'browser-popup-approved.json',
+    run               : runApprovedPopupBrowserProof,
   }));
   entries.push(await runEvidence({
     contract          : linuxProofContracts.didRuntime,

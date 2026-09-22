@@ -3,6 +3,7 @@
 import type { LabCheck, LabProofReport } from './proof-result.js';
 
 import { exitCodeForProofStatus } from './proof-result.js';
+import { runApprovedPopupBrowserProof } from './proofs/connect/approved-popup-browser-proof.js';
 import { runCatalogPreflightCli } from './catalog/preflight.js';
 import { runConnectBrowserProof } from './proofs/connect/connect-browser-proof.js';
 import { runDidRuntimeProof } from './proofs/did-runtime/did-runtime-proof.js';
@@ -17,6 +18,7 @@ const usage = `enbox-lab <command> [options]
 Commands:
   catalog      Verify pinned historical DWN source or fixture capabilities.
   connect-browser  Run real Chromium popup and relay connect denial boundaries.
+  connect-popup-approved  Run a real Chromium popup approval through the released agent and server.
   did-browser  Run real Chromium did:dht publication through an owned private gateway.
   did-runtime  Run the owned private-Pkarr restart and restoration proof.
   did-server   Prove released-server authorization through two isolated private DID networks.
@@ -108,6 +110,21 @@ async function run(): Promise<number> {
     }
     const report = await runConnectBrowserProof();
     if (connectBrowserArgs.includes('--json')) {
+      console.log(JSON.stringify(report, undefined, 2));
+    } else {
+      printTextReport(report);
+    }
+    return exitCodeForProofStatus(report.status);
+  }
+
+  if (command === 'connect-popup-approved') {
+    const approvedPopupArgs = args.slice(1);
+    if (approvedPopupArgs.some((argument): boolean => argument !== '--json')) {
+      console.error(usage);
+      return 2;
+    }
+    const report = await runApprovedPopupBrowserProof();
+    if (approvedPopupArgs.includes('--json')) {
       console.log(JSON.stringify(report, undefined, 2));
     } else {
       printTextReport(report);
