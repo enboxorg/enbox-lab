@@ -655,9 +655,18 @@ function cleanupCheck(failureCodes: string[]): LabCheck {
   };
 }
 
-function executionFailure(stage: ProofStage): LabCheck {
+function safeRuntimeFailureReason(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message.startsWith('DidServerRuntime:')) { return undefined; }
+  return error.message
+    .replace(/https?:\/\/127\.0\.0\.1:\d+\/__lab\/resolver\/[^\s"'<>]*/gu, '[redacted-resolver-endpoint]')
+    .replace(/\b[0-9a-f]{64}\b/giu, '[redacted-capability]')
+    .slice(0, 512);
+}
+
+function executionFailure(stage: ProofStage, error: unknown): LabCheck {
+  const reason = safeRuntimeFailureReason(error);
   return {
-    details : { failureStage: stage },
+    details : { failureStage: stage, ...(reason === undefined ? {} : { reason }) },
     id      : 'server-private-did-proof-execution',
     status  : 'fail',
     summary : 'The server private DID proof stopped before completing its machine observations',
@@ -836,8 +845,8 @@ async function runServerPrivateDidProofWithDependencies(
       };
       checks.push(...serverPrivateDidVerdicts(observation));
     }
-  } catch {
-    checks.push(executionFailure(stage));
+  } catch (error: unknown) {
+    checks.push(executionFailure(stage, error));
   } finally {
     const cleanupFailures = await cleanupResources(resources, dependencies);
     checks.push(cleanupCheck(cleanupFailures));

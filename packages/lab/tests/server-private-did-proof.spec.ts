@@ -139,7 +139,7 @@ function proofHarness(options: HarnessOptions = {}): Readonly<{
           await Promise.resolve();
           activeRuntimeStarts -= 1;
           if (options.runtimeStartFailure === slot) {
-            throw new Error(`${resolverEndpoint}: start failed`);
+            throw new Error(`DidServerRuntime: ${resolverEndpoint}: start failed`);
           }
           return {
             childArgumentsContainResolverBaseUri    : false as const,
@@ -425,10 +425,15 @@ describe('server private DID proof', () => {
     const report = await serverPrivateDidProofInternals.runServerPrivateDidProofWithDependencies({}, harness.dependencies);
 
     expect(report.status).toBe('fail');
-    expect(report.checks).toContainEqual(expect.objectContaining({
-      details : { failureStage: 'runtime-start' },
-      id      : 'server-private-did-proof-execution',
-    }));
+    const execution = report.checks.find((check) => check.id === 'server-private-did-proof-execution');
+    expect(execution).toMatchObject({
+      details: {
+        failureStage : 'runtime-start',
+        reason       : 'DidServerRuntime: [redacted-resolver-endpoint] start failed',
+      },
+      status: 'fail',
+    });
+    expect(JSON.stringify(execution)).not.toContain(KNOWN_CAPABILITY);
     expect(harness.events).toEqual([
       'children:a:stop',
       'children:b:force',
