@@ -1,8 +1,6 @@
 import type { ProtocolDefinition } from '@enbox/dwn-sdk-js';
 import type { ConnectClientMetadata, ConnectPermissionRequest, ConnectRequest } from '@enbox/connect';
 
-import { isDeepStrictEqual } from 'node:util';
-
 import { assertConnectRequest } from '@enbox/connect';
 import { DwnInterfaceName, DwnMethodName } from '@enbox/dwn-sdk-js';
 
@@ -77,6 +75,21 @@ function hasExpectedRequestKeys(value: Record<string, unknown>): boolean {
   return required.every((key): boolean => actual.includes(key)) && hasOnlyKeys(value, REQUEST_KEYS);
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key): string =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function isDeepEqual(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
 function boundedOptionalString(value: unknown, maximum: number): boolean {
   return value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= maximum);
 }
@@ -135,11 +148,11 @@ export function assertLabNoteWritePopupRequest(
     (value.expectedProviderDid !== undefined && value.expectedProviderDid !== providerDid) ||
     !/^did:jwk:[A-Za-z0-9_-]{16,2048}$/u.test(value.clientDid) ||
     !/^[A-Za-z0-9_-]{22}$/u.test(value.nonce) || !/^[A-Za-z0-9_-]{22}$/u.test(value.state) ||
-    !isRecord(value.reply) || !isDeepStrictEqual(value.reply, { mode: 'post_message' }) ||
+    !isRecord(value.reply) || !isDeepEqual(value.reply, { mode: 'post_message' }) ||
     !isRecord(value.responseKey) || !hasOnlyKeys(value.responseKey, ['crv', 'kty', 'x']) ||
-    !isDeepStrictEqual(value.supportedDidMethods, ['did:dht', 'did:jwk']) ||
+    !isDeepEqual(value.supportedDidMethods, ['did:dht', 'did:jwk']) ||
     !validClientMetadata(value.clientMetadata, dappOrigin) ||
-    !isDeepStrictEqual(value.permissionRequests, [LAB_NOTE_WRITE_PERMISSION_REQUEST])) {
+    !isDeepEqual(value.permissionRequests, [LAB_NOTE_WRITE_PERMISSION_REQUEST])) {
     throw new Error('AgentProcessNoteWriteApproval: popup request is outside the fixed note-write policy');
   }
 }
@@ -147,17 +160,6 @@ export function assertLabNoteWritePopupRequest(
 /** Returns a JSON-owned snapshot so later caller mutation cannot alter the approved request. */
 export function cloneLabNoteWritePopupRequest(value: ConnectRequest): ConnectRequest {
   return JSON.parse(JSON.stringify(value)) as ConnectRequest;
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(',')}]`;
-  }
-  if (isRecord(value)) {
-    return `{${Object.keys(value).sort().map((key): string =>
-      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
 }
 
 /** Fingerprints every admitted request field for process-lifetime replay rejection. */

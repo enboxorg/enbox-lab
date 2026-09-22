@@ -28,6 +28,7 @@ Run the live boundary proofs:
 ```sh
 bun packages/lab/src/cli.ts routing --json
 bun packages/lab/src/cli.ts connect-browser --json
+bun packages/lab/src/cli.ts connect-popup-approved --json
 bun packages/lab/src/cli.ts did-browser --json
 bun packages/lab/src/cli.ts did-runtime --json
 bun packages/lab/src/cli.ts did-server --json
@@ -39,9 +40,9 @@ Run the complete Linux CI evidence contract against a full Enbox source clone:
 bun run verify:linux --repository ../enbox --evidence /tmp/enbox-lab-evidence
 ```
 
-This command runs the prerequisite, catalog, routing, browser DID, server DID, browser connect, and DID runtime reports. It
+This command runs the prerequisite, catalog, routing, browser DID, server DID, browser denial, approved popup, and DID runtime reports. It
 requires every established Linux subcheck to pass, accepts only the explicitly
-listed remaining unsupported gates, and writes the seven reports plus a
+listed remaining unsupported gates, and writes the eight reports plus a
 verification summary to the evidence directory.
 
 The Linux routing candidate assigns a distinct `http://localhost:<actor-port>` origin to each actor. The host gateway publishes those ports, while actor-local IPv4/IPv6 forwarders preserve the same URLs inside containers.
@@ -52,9 +53,11 @@ Released agent processes can use a separate nonsecret loopback actor ingress for
 
 The agent-process runtime starts the exact released `@enbox/agent@0.8.48` with an isolated durable data path and `localDwnStrategy: 'off'`. Each vault first reports locked, accepts its password through bounded stdin, publishes only through its assigned actor ingress, and proves a locked shutdown before the same agent DID can be reopened. This is process-backed wallet evidence; browser-native agent configuration still depends on a released Enbox package cohort with the per-instance DID changes.
 
-The headless popup-approval seam admits one fixed, unencrypted note-write policy. The released agent installs that protocol on its assigned released DWN server, creates the Records.Write and matching revocation grants, seals the wallet-minted delegate credentials inside the child, and returns only the opaque response JWE. The agent DID is the provisional single profile for this proof. Browser consent delivery, an authenticated worker-to-agent channel, relay PIN handling, user identities, encrypted records, and outsider denial remain later stack layers.
+The headless popup-approval seam admits one fixed, unencrypted note-write policy. The released agent installs that protocol on its assigned released DWN server, creates the Records.Write and matching revocation grants, seals the wallet-minted delegate credentials inside the child, and returns only the opaque response JWE. The agent DID is the provisional single profile for this proof. Final controller-to-wallet authentication, relay PIN handling, user identities, encrypted records, and outsider denial remain later stack layers.
 
-The popup approval bridge binds an already-opened request to a server-owned one-shot handle. Its three POST routes require the exact wallet Host and Origin, same-origin fetch metadata, bounded JSON, and a 256-bit session credential carried only in a header. Approval consumes the stored snapshot, and delivery retries return the same cached ciphertext without repeating the ceremony. Chromium integration still remains a separate proof layer.
+The popup approval bridge binds an already-opened request to a server-owned one-shot handle. Its three POST routes require the exact wallet Host and Origin, same-origin fetch metadata, bounded JSON, and a 256-bit session credential carried only in a header. Approval consumes the stored snapshot, and delivery retries return the same cached ciphertext without repeating the ceremony.
+
+The approved popup proof drives the official dapp and wallet postMessage transports in managed Chromium, clicks the explicit fixture consent control, calls the bridge, and opens the sealed delegate response in the dapp. It composes one real private Pkarr testnet, the exact released server and agent, and the provisional agent-DID provider. Automation provisions the bridge session for this fixture; the final controller-to-wallet provisioning design remains unfinished.
 
 The browser DID proof uses a frozen actor bootstrap and a typed service worker to make one causally attributed private lookup. It rejects reconfiguration, unconfigured sibling clients, and foreign-worker traffic before unexpected upstream access.
 

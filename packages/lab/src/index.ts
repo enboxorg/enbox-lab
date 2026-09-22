@@ -7,6 +7,14 @@ export * from './proof-result.js';
 export type { ConnectBrowserProofOptions } from './proofs/connect/connect-browser-proof.js';
 export { runConnectBrowserProof } from './proofs/connect/connect-browser-proof.js';
 export type {
+  ApprovedPopupBrowserObservation,
+  ApprovedPopupBrowserProofOptions,
+} from './proofs/connect/approved-popup-browser-proof.js';
+export {
+  approvedPopupBrowserVerdicts,
+  runApprovedPopupBrowserProof,
+} from './proofs/connect/approved-popup-browser-proof.js';
+export type {
   BoundConnectWorkerRequest,
   ConnectWorkerBoundaryErrorCode,
   ConnectWorkerChannelBinding,
