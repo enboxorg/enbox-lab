@@ -1,5 +1,8 @@
+import type { ConnectRequest } from '@enbox/connect';
+
 import { isAbsolute, normalize } from 'node:path';
 
+export const AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES = 65_536;
 export const AGENT_PROCESS_CHILD_MAX_LINE_BYTES = 4_096;
 export const AGENT_PROCESS_PACKAGE_NAME = '@enbox/agent';
 export const AGENT_PROCESS_PACKAGE_VERSION = '0.8.48';
@@ -24,6 +27,17 @@ export type AgentProcessChildSecretCommand = Readonly<{
 export type AgentProcessChildStopCommand = Readonly<{
   type: 'stop';
 }>;
+
+export type AgentProcessChildApproveNoteWritePopupCommand = Readonly<{
+  dappOrigin: string;
+  id: string;
+  request: ConnectRequest;
+  type: 'approve-note-write-popup';
+}>;
+
+export type AgentProcessChildActiveCommand =
+  | AgentProcessChildApproveNoteWritePopupCommand
+  | AgentProcessChildStopCommand;
 
 export type AgentProcessChildAwaitingSecret = Readonly<{
   firstLaunch: boolean;
@@ -51,6 +65,27 @@ export type AgentProcessChildStopped = Readonly<{
   type: 'stopped';
 }>;
 
+export const AGENT_PROCESS_APPROVAL_PHASES = [
+  'delegate',
+  'protocols',
+  'permission-grants',
+  'grant-keys',
+  'revocations',
+] as const;
+
+export type AgentProcessChildNoteWritePopupApproved = Readonly<{
+  id: string;
+  idToken: string;
+  type: 'note-write-popup-approved';
+}>;
+
+export type AgentProcessChildCommandFailure = Readonly<{
+  code: 'capacity-exceeded' | 'invalid-request' | 'replayed-request' | 'outcome-unknown' | 'reconciliation-required';
+  id: string;
+  needsReconciliation: boolean;
+  type: 'agent-command-failed';
+}>;
+
 function byteLengthWithin(value: string, maximum: number): boolean {
   return Buffer.byteLength(value, 'utf8') <= maximum;
 }
@@ -65,8 +100,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function parseJsonRecord(line: string): Record<string, unknown> {
-  if (line.length === 0 || !byteLengthWithin(line, AGENT_PROCESS_CHILD_MAX_LINE_BYTES)) {
+function parseJsonRecord(line: string, maximum = AGENT_PROCESS_CHILD_MAX_LINE_BYTES): Record<string, unknown> {
+  if (line.length === 0 || !byteLengthWithin(line, maximum)) {
     throw new Error('AgentProcessChildProtocol: invalid command');
   }
   let value: unknown;
@@ -79,6 +114,11 @@ function parseJsonRecord(line: string): Record<string, unknown> {
     throw new Error('AgentProcessChildProtocol: invalid command');
   }
   return value;
+}
+
+function canonicalUuid(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
 }
 
 function parseCanonicalLoopbackUrl(value: unknown, trailingSlash: boolean): string {
@@ -143,6 +183,27 @@ export function parseAgentProcessChildStopCommand(line: string): AgentProcessChi
     throw new Error('AgentProcessChildProtocol: invalid stop command');
   }
   return { type: 'stop' };
+}
+
+/** Parses the exact post-activation command surface without accepting generic agent operations. */
+export function parseAgentProcessChildActiveCommand(line: string): AgentProcessChildActiveCommand {
+  const value = parseJsonRecord(line, AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES);
+  if (value.type === 'stop') {
+    return parseAgentProcessChildStopCommand(line);
+  }
+  if (value.type === 'approve-note-write-popup') {
+    if (!hasExactKeys(value, ['dappOrigin', 'id', 'request', 'type']) || typeof value.dappOrigin !== 'string' ||
+      !canonicalUuid(value.id) || !isRecord(value.request)) {
+      throw new Error('AgentProcessChildProtocol: invalid active command');
+    }
+    return {
+      dappOrigin : value.dappOrigin,
+      id         : value.id,
+      request    : value.request as ConnectRequest,
+      type       : 'approve-note-write-popup',
+    };
+  }
+  throw new Error('AgentProcessChildProtocol: invalid active command');
 }
 
 export function isDidDhtUri(value: string): boolean {

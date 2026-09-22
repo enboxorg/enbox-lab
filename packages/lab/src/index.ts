@@ -33,11 +33,23 @@ export { runServerPrivateDidProof } from './proofs/did-server/server-private-did
 export * from './proofs/routing/index.js';
 export type {
   AgentProcessDestroyEvidence,
+  AgentProcessNoteWritePopupApproval,
+  AgentProcessNoteWritePopupApprovalParams,
   AgentProcessRuntimeEvidence,
   AgentProcessRuntimeOptions,
   AgentProcessStartParams,
   AgentProcessStopEvidence,
 } from './runtime/agent-process/agent-process-runtime.js';
-export { AgentProcessRuntime } from './runtime/agent-process/agent-process-runtime.js';
+export {
+  AgentProcessApprovalOutcomeUnknownError,
+  AgentProcessRuntime,
+} from './runtime/agent-process/agent-process-runtime.js';
+export {
+  LAB_NOTE_WRITE_APP_NAME,
+  LAB_NOTE_WRITE_PERMISSION_REQUEST,
+  LAB_NOTE_WRITE_PROTOCOL_DEFINITION,
+  LAB_NOTE_WRITE_PROTOCOL_URI,
+  LAB_NOTE_WRITE_SESSION_TTL_SECONDS,
+} from './runtime/agent-process/note-write-approval.js';
 export * from './runtime/chromium.js';
 export * from './runtime/private-pkarr-testnet.js';

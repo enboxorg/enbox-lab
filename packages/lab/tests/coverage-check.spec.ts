@@ -37,5 +37,6 @@ end_of_record
     expect(criticalCoverageFloors['src/proofs/did-browser/fixture/did-service-worker-protocol.ts']).toBe(85);
     expect(criticalCoverageFloors['src/runtime/agent-process/agent-process-child-protocol.ts']).toBe(90);
     expect(criticalCoverageFloors['src/runtime/agent-process/agent-process-runtime.ts']).toBe(90);
+    expect(criticalCoverageFloors['src/runtime/agent-process/note-write-approval.ts']).toBe(90);
   });
 });

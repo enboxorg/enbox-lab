@@ -10,6 +10,7 @@ import { startPkarrPublicationServer } from '../../src/pkarr-publication-server.
 export type TestPkarrGateway = Readonly<{
   close(): Promise<void>;
   endpoint: string;
+  resolverEndpoint: string;
   requests(): readonly Readonly<{ identifier?: string; method: string }>[];
   server: PkarrPublicationServer;
 }>;
@@ -43,10 +44,12 @@ export async function startTestPkarrGateway(label: string): Promise<TestPkarrGat
         });
     },
     journalLocation : join(directory, 'journal.sqlite'),
+    resolverIngress : true,
     upstreamBaseUrl : `http://${label}.invalid:15411/`,
   });
   const endpoint = server.actorEndpoint();
-  if (endpoint === undefined) {
+  const resolverEndpoint = server.resolverEndpoint();
+  if (endpoint === undefined || resolverEndpoint === undefined) {
     await server.stop();
     await rm(directory, { force: true, recursive: true });
     throw new Error('Test Pkarr gateway did not expose its actor ingress.');
@@ -57,6 +60,7 @@ export async function startTestPkarrGateway(label: string): Promise<TestPkarrGat
       await rm(directory, { force: true, recursive: true });
     },
     endpoint,
+    resolverEndpoint,
     requests: (): readonly Readonly<{ identifier?: string; method: string }>[] => requests,
     server,
   };
