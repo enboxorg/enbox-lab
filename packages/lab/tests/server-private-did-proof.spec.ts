@@ -16,10 +16,12 @@ type ProofTestnet = ReturnType<ProofDependencies['createTestnet']>;
 type TrackedAdapter = Awaited<ReturnType<ProofDependencies['startAdapter']>>;
 
 type HarnessOptions = Readonly<{
+  adapterStartFailure?: 'a' | 'b';
   cleanupFailures?: ReadonlySet<string>;
   dockerUnavailable?: boolean;
   executeFailure?: boolean;
   ownershipCollision?: boolean;
+  runtimeCreateFailure?: 'a' | 'b';
   runtimeStartFailure?: 'a' | 'b';
   testnetStartFailure?: 'a' | 'b';
   unverified?: 'a' | 'b';
@@ -106,8 +108,13 @@ function runtimeCleanup(slot: 'a' | 'b'): DidServerRuntimeStopEvidence {
 function proofHarness(options: HarnessOptions = {}): Readonly<{
   dependencies: ProofDependencies;
   events: string[];
+  maxConcurrentRuntimeStarts(): number;
+  runtimeStarts: string[];
 }> {
+  let activeRuntimeStarts = 0;
   const events: string[] = [];
+  let maxConcurrentRuntimeStarts = 0;
+  const runtimeStarts: string[] = [];
   const cleanupFailures = options.cleanupFailures ?? new Set<string>();
   const dependencies: ProofDependencies = {
     createDirectory: async (prefix): Promise<string> => {
@@ -116,6 +123,9 @@ function proofHarness(options: HarnessOptions = {}): Readonly<{
     },
     createRuntime: async (slot, resolverEndpoint) => {
       expect(resolverEndpoint).toBe(slot === 'a' ? KNOWN_RESOLVER_A : KNOWN_RESOLVER_B);
+      if (options.runtimeCreateFailure === slot) {
+        throw new Error(`${resolverEndpoint}: create failed`);
+      }
       return {
         forceDispose: async (): Promise<DidServerRuntimeStopEvidence> => {
           events.push(`children:${slot}:force`);
@@ -123,8 +133,13 @@ function proofHarness(options: HarnessOptions = {}): Readonly<{
           return runtimeCleanup(slot);
         },
         start: async (): Promise<ProofRuntimeEvidence> => {
+          runtimeStarts.push(slot);
+          activeRuntimeStarts += 1;
+          maxConcurrentRuntimeStarts = Math.max(maxConcurrentRuntimeStarts, activeRuntimeStarts);
+          await Promise.resolve();
+          activeRuntimeStarts -= 1;
           if (options.runtimeStartFailure === slot) {
-            throw new Error(`${resolverEndpoint}: start failed`);
+            throw new Error(`DidServerRuntime: ${resolverEndpoint}: start failed`);
           }
           return {
             childArgumentsContainResolverBaseUri    : false as const,
@@ -182,20 +197,28 @@ function proofHarness(options: HarnessOptions = {}): Readonly<{
       events.push(`directories:${slot}`);
       if (cleanupFailures.has(`directories:${slot}`)) { throw new Error(`${path}: secret`); }
     },
-    startAdapter: async ({ slot }) => ({
-      publicationEndpoint : `http://127.0.0.1:4400${slot === 'a' ? 1 : 2}/`,
-      resolverEndpoint    : (): string => slot === 'a' ? KNOWN_RESOLVER_A : KNOWN_RESOLVER_B,
-      resolverObservation : () => ({ admitted: 0, rejected: 0 }),
-      stop                : async (): Promise<void> => {
-        events.push(`adapters:${slot}`);
-        if (cleanupFailures.has(`adapters:${slot}`)) {
-          throw new Error(`${slot === 'a' ? KNOWN_RESOLVER_A : KNOWN_RESOLVER_B}: secret`);
-        }
-      },
-      upstreamRequests: () => [],
-    }),
+    startAdapter: async ({ slot }) => {
+      if (options.adapterStartFailure === slot) { throw new Error(`adapter ${slot} failed`); }
+      return {
+        publicationEndpoint : `http://127.0.0.1:4400${slot === 'a' ? 1 : 2}/`,
+        resolverEndpoint    : (): string => slot === 'a' ? KNOWN_RESOLVER_A : KNOWN_RESOLVER_B,
+        resolverObservation : () => ({ admitted: 0, rejected: 0 }),
+        stop                : async (): Promise<void> => {
+          events.push(`adapters:${slot}`);
+          if (cleanupFailures.has(`adapters:${slot}`)) {
+            throw new Error(`${slot === 'a' ? KNOWN_RESOLVER_A : KNOWN_RESOLVER_B}: secret`);
+          }
+        },
+        upstreamRequests: () => [],
+      };
+    },
   };
-  return { dependencies, events };
+  return {
+    dependencies,
+    events,
+    maxConcurrentRuntimeStarts: (): number => maxConcurrentRuntimeStarts,
+    runtimeStarts,
+  };
 }
 
 describe('server private DID proof', () => {
@@ -402,15 +425,59 @@ describe('server private DID proof', () => {
     const report = await serverPrivateDidProofInternals.runServerPrivateDidProofWithDependencies({}, harness.dependencies);
 
     expect(report.status).toBe('fail');
-    expect(report.checks).toContainEqual(expect.objectContaining({
-      details : { failureStage: 'runtime-start' },
-      id      : 'server-private-did-proof-execution',
-    }));
+    const execution = report.checks.find((check) => check.id === 'server-private-did-proof-execution');
+    expect(execution).toMatchObject({
+      details: {
+        failureStage : 'runtime-start',
+        reason       : 'DidServerRuntime: [redacted-resolver-endpoint] start failed',
+      },
+      status: 'fail',
+    });
+    expect(JSON.stringify(execution)).not.toContain(KNOWN_CAPABILITY);
     expect(harness.events).toEqual([
       'children:a:stop',
       'children:b:force',
       'adapters:a',
       'adapters:b',
+      'directories:a',
+      'directories:b',
+      'testnets:a',
+      'testnets:b',
+    ]);
+  });
+
+  it('should force a created child when its peer cannot be created', async () => {
+    const harness = proofHarness({ runtimeCreateFailure: 'b' });
+    const report = await serverPrivateDidProofInternals.runServerPrivateDidProofWithDependencies({}, harness.dependencies);
+
+    expect(report.status).toBe('fail');
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      details : { failureStage: 'runtime-create' },
+      id      : 'server-private-did-proof-execution',
+    }));
+    expect(harness.runtimeStarts).toEqual([]);
+    expect(harness.events).toEqual([
+      'children:a:force',
+      'adapters:a',
+      'adapters:b',
+      'directories:a',
+      'directories:b',
+      'testnets:a',
+      'testnets:b',
+    ]);
+  });
+
+  it('should clean a started adapter when its peer cannot start', async () => {
+    const harness = proofHarness({ adapterStartFailure: 'b' });
+    const report = await serverPrivateDidProofInternals.runServerPrivateDidProofWithDependencies({}, harness.dependencies);
+
+    expect(report.status).toBe('fail');
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      details : { failureStage: 'adapter-start' },
+      id      : 'server-private-did-proof-execution',
+    }));
+    expect(harness.events).toEqual([
+      'adapters:a',
       'directories:a',
       'directories:b',
       'testnets:a',
@@ -482,6 +549,8 @@ describe('server private DID proof', () => {
     expect(serialized).not.toContain(KNOWN_CAPABILITY);
     expect(serialized).not.toContain('/__lab/resolver/');
     expect(serialized).not.toContain('"detail":');
+    expect(harness.maxConcurrentRuntimeStarts()).toBe(1);
+    expect(harness.runtimeStarts).toEqual(['a', 'b']);
     expect(harness.events).toEqual([
       'children:a:stop',
       'children:b:stop',

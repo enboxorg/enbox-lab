@@ -51,5 +51,17 @@ export {
   LAB_NOTE_WRITE_PROTOCOL_URI,
   LAB_NOTE_WRITE_SESSION_TTL_SECONDS,
 } from './runtime/agent-process/note-write-approval.js';
+export type {
+  PopupApprovalBridgeBootstrap,
+  PopupApprovalBridgeOptions,
+} from './runtime/popup-approval-bridge.js';
+export {
+  POPUP_APPROVAL_APPROVE_PATH,
+  POPUP_APPROVAL_BIND_PATH,
+  POPUP_APPROVAL_CANCEL_PATH,
+  POPUP_APPROVAL_MAX_BODY_BYTES,
+  POPUP_APPROVAL_SESSION_HEADER,
+  PopupApprovalBridge,
+} from './runtime/popup-approval-bridge.js';
 export * from './runtime/chromium.js';
 export * from './runtime/private-pkarr-testnet.js';

@@ -655,9 +655,18 @@ function cleanupCheck(failureCodes: string[]): LabCheck {
   };
 }
 
-function executionFailure(stage: ProofStage): LabCheck {
+function safeRuntimeFailureReason(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message.startsWith('DidServerRuntime:')) { return undefined; }
+  return error.message
+    .replace(/https?:\/\/127\.0\.0\.1:\d+\/__lab\/resolver\/[^\s"'<>]*/gu, '[redacted-resolver-endpoint]')
+    .replace(/\b[0-9a-f]{64}\b/giu, '[redacted-capability]')
+    .slice(0, 512);
+}
+
+function executionFailure(stage: ProofStage, error: unknown): LabCheck {
+  const reason = safeRuntimeFailureReason(error);
   return {
-    details : { failureStage: stage },
+    details : { failureStage: stage, ...(reason === undefined ? {} : { reason }) },
     id      : 'server-private-did-proof-execution',
     status  : 'fail',
     summary : 'The server private DID proof stopped before completing its machine observations',
@@ -804,17 +813,13 @@ async function runServerPrivateDidProofWithDependencies(
       }
 
       stage = 'runtime-start';
-      const runtimeStartResults = await Promise.allSettled([
-        resources.runtimeA.start(),
-        resources.runtimeB.start(),
-      ]);
-      resources.runtimeAStarted = runtimeStartResults[0].status === 'fulfilled';
-      resources.runtimeBStarted = runtimeStartResults[1].status === 'fulfilled';
-      if (runtimeStartResults[0].status !== 'fulfilled' || runtimeStartResults[1].status !== 'fulfilled') {
-        throw new Error('Server private DID proof could not start both server children');
-      }
-      const runtimeEvidenceA = runtimeStartResults[0].value;
-      const runtimeEvidenceB = runtimeStartResults[1].value;
+      // Bun's cold SQL/server initialization can contend when two released children start at the
+      // same instant. The proof requires concurrent operation, not concurrent startup, so remove
+      // that nondeterministic launch race while keeping both children live for every observation.
+      const runtimeEvidenceA = await resources.runtimeA.start();
+      resources.runtimeAStarted = true;
+      const runtimeEvidenceB = await resources.runtimeB.start();
+      resources.runtimeBStarted = true;
 
       stage = 'proof-execution';
       const boundary = await dependencies.executeScenario({
@@ -840,8 +845,8 @@ async function runServerPrivateDidProofWithDependencies(
       };
       checks.push(...serverPrivateDidVerdicts(observation));
     }
-  } catch {
-    checks.push(executionFailure(stage));
+  } catch (error: unknown) {
+    checks.push(executionFailure(stage, error));
   } finally {
     const cleanupFailures = await cleanupResources(resources, dependencies);
     checks.push(cleanupCheck(cleanupFailures));
