@@ -133,6 +133,14 @@ describe('agent child command protocol', () => {
       id         : TEST_ID,
       type       : 'approve-note-write-popup',
     });
+    expect(parseAgentProcessChildActiveCommand(JSON.stringify({
+      dappOrigin  : 'http://localhost:44001',
+      id          : TEST_ID,
+      pin         : '4821',
+      relayOrigin : 'http://127.0.0.1:44003',
+      request     : {},
+      type        : 'approve-note-write-relay',
+    }))).toMatchObject({ pin: '4821', type: 'approve-note-write-relay' });
     expect(parseAgentProcessChildActiveCommand('{"type":"stop"}')).toEqual({ type: 'stop' });
 
     for (const invalid of [
@@ -140,6 +148,14 @@ describe('agent child command protocol', () => {
       JSON.stringify({ dappOrigin: 'http://localhost:44001', id: 'not-a-uuid', request: {}, type: 'approve-note-write-popup' }),
       JSON.stringify({ dappOrigin: 'http://localhost:44001', id: TEST_ID, request: [], type: 'approve-note-write-popup' }),
       JSON.stringify({ dappOrigin: 'http://localhost:44001', id: TEST_ID, request: {}, type: 'sign' }),
+      JSON.stringify({
+        dappOrigin  : 'http://localhost:44001',
+        id          : TEST_ID,
+        pin         : 'secret',
+        relayOrigin : 'http://127.0.0.1:44003',
+        request     : {},
+        type        : 'approve-note-write-relay',
+      }),
       'x'.repeat(AGENT_PROCESS_ACTIVE_MAX_LINE_BYTES + 1),
     ]) {
       expect((): unknown => parseAgentProcessChildActiveCommand(invalid)).toThrow();

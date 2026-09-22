@@ -35,7 +35,17 @@ export type AgentProcessChildApproveNoteWritePopupCommand = Readonly<{
   type: 'approve-note-write-popup';
 }>;
 
+export type AgentProcessChildApproveNoteWriteRelayCommand = Readonly<{
+  dappOrigin: string;
+  id: string;
+  pin: string;
+  relayOrigin: string;
+  request: ConnectRequest;
+  type: 'approve-note-write-relay';
+}>;
+
 export type AgentProcessChildActiveCommand =
+  | AgentProcessChildApproveNoteWriteRelayCommand
   | AgentProcessChildApproveNoteWritePopupCommand
   | AgentProcessChildStopCommand;
 
@@ -77,6 +87,12 @@ export type AgentProcessChildNoteWritePopupApproved = Readonly<{
   id: string;
   idToken: string;
   type: 'note-write-popup-approved';
+}>;
+
+export type AgentProcessChildNoteWriteRelayApproved = Readonly<{
+  id: string;
+  idToken: string;
+  type: 'note-write-relay-approved';
 }>;
 
 export type AgentProcessChildCommandFailure = Readonly<{
@@ -201,6 +217,21 @@ export function parseAgentProcessChildActiveCommand(line: string): AgentProcessC
       id         : value.id,
       request    : value.request as ConnectRequest,
       type       : 'approve-note-write-popup',
+    };
+  }
+  if (value.type === 'approve-note-write-relay') {
+    if (!hasExactKeys(value, ['dappOrigin', 'id', 'pin', 'relayOrigin', 'request', 'type']) ||
+      typeof value.dappOrigin !== 'string' || !canonicalUuid(value.id) || !/^\d{4}$/u.test(String(value.pin)) ||
+      typeof value.pin !== 'string' || typeof value.relayOrigin !== 'string' || !isRecord(value.request)) {
+      throw new Error('AgentProcessChildProtocol: invalid active command');
+    }
+    return {
+      dappOrigin  : value.dappOrigin,
+      id          : value.id,
+      pin         : value.pin,
+      relayOrigin : value.relayOrigin,
+      request     : value.request as ConnectRequest,
+      type        : 'approve-note-write-relay',
     };
   }
   throw new Error('AgentProcessChildProtocol: invalid active command');

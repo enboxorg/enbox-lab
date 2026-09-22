@@ -1,6 +1,7 @@
 import type { ConnectRequest } from '@enbox/connect';
 
 import { createTestNoteWritePopupRequest } from './test-note-write-popup.js';
+import { createTestNoteWriteRelayRequest } from './test-note-write-relay.js';
 
 import { describe, expect, it } from 'bun:test';
 
@@ -8,7 +9,9 @@ import { DwnInterfaceName, DwnMethodName } from '@enbox/dwn-sdk-js';
 
 import {
   assertLabNoteWritePopupRequest,
+  assertLabNoteWriteRelayRequest,
   cloneLabNoteWritePopupRequest,
+  cloneLabNoteWriteRequest,
   fingerprintLabNoteWritePopupRequest,
   LAB_NOTE_WRITE_PERMISSION_REQUEST,
   LAB_NOTE_WRITE_PROTOCOL_DEFINITION,
@@ -80,5 +83,38 @@ describe('fixed note-write popup approval policy', () => {
 
     fixture.request.permissionRequests.length = 0;
     expect(snapshot.permissionRequests).toHaveLength(1);
+  });
+
+  it('should admit only the exact direct-post callback and private relay origin', async () => {
+    const fixture = await createTestNoteWriteRelayRequest();
+    expect((): void => assertLabNoteWriteRelayRequest(
+      fixture.request,
+      PROVIDER_DID,
+      fixture.dappOrigin,
+      fixture.relayOrigin,
+    )).not.toThrow();
+
+    for (const mutate of [
+      (request: ConnectRequest): void => {
+        request.reply = { callbackUrl: `${fixture.relayOrigin}/connect/other`, mode: 'direct_post' };
+      },
+      (request: ConnectRequest): void => { request.reply = { mode: 'post_message' }; },
+      (request: ConnectRequest): void => { request.clientMetadata!.origin = 'http://localhost:44009'; },
+    ]) {
+      const request = cloneLabNoteWriteRequest(fixture.request);
+      mutate(request);
+      expect((): void => assertLabNoteWriteRelayRequest(
+        request,
+        PROVIDER_DID,
+        fixture.dappOrigin,
+        fixture.relayOrigin,
+      )).toThrow();
+    }
+    expect((): void => assertLabNoteWriteRelayRequest(
+      fixture.request,
+      PROVIDER_DID,
+      fixture.dappOrigin,
+      'http://localhost:44003',
+    )).toThrow('invalid relay origin');
   });
 });

@@ -43,6 +43,8 @@ export type {
   AgentProcessDestroyEvidence,
   AgentProcessNoteWritePopupApproval,
   AgentProcessNoteWritePopupApprovalParams,
+  AgentProcessNoteWriteRelayApproval,
+  AgentProcessNoteWriteRelayApprovalParams,
   AgentProcessRuntimeEvidence,
   AgentProcessRuntimeOptions,
   AgentProcessStartParams,
@@ -62,6 +64,8 @@ export {
 export type {
   PopupApprovalBridgeBootstrap,
   PopupApprovalBridgeOptions,
+  RelayApprovalBridgeBootstrap,
+  RelayApprovalBridgeOptions,
 } from './runtime/popup-approval-bridge.js';
 export {
   POPUP_APPROVAL_APPROVE_PATH,
@@ -70,6 +74,10 @@ export {
   POPUP_APPROVAL_MAX_BODY_BYTES,
   POPUP_APPROVAL_SESSION_HEADER,
   PopupApprovalBridge,
+  RELAY_APPROVAL_APPROVE_PATH,
+  RELAY_APPROVAL_BIND_PATH,
+  RELAY_APPROVAL_CANCEL_PATH,
+  RelayApprovalBridge,
 } from './runtime/popup-approval-bridge.js';
 export * from './runtime/chromium.js';
 export * from './runtime/private-pkarr-testnet.js';
