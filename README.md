@@ -54,6 +54,8 @@ The agent-process runtime starts the exact released `@enbox/agent@0.8.48` with a
 
 The headless popup-approval seam admits one fixed, unencrypted note-write policy. The released agent installs that protocol on its assigned released DWN server, creates the Records.Write and matching revocation grants, seals the wallet-minted delegate credentials inside the child, and returns only the opaque response JWE. The agent DID is the provisional single profile for this proof. Browser consent delivery, an authenticated worker-to-agent channel, relay PIN handling, user identities, encrypted records, and outsider denial remain later stack layers.
 
+The popup approval bridge binds an already-opened request to a server-owned one-shot handle. Its three POST routes require the exact wallet Host and Origin, same-origin fetch metadata, bounded JSON, and a 256-bit session credential carried only in a header. Approval consumes the stored snapshot, and delivery retries return the same cached ciphertext without repeating the ceremony. Chromium integration still remains a separate proof layer.
+
 The browser DID proof uses a frozen actor bootstrap and a typed service worker to make one causally attributed private lookup. It rejects reconfiguration, unconfigured sibling clients, and foreign-worker traffic before unexpected upstream access.
 
 The server DID proof starts two independently owned private Pkarr testnets and the exact released DWN server in isolated child processes. A DID published only in lab A authenticates at A, fails resolution at B, and still resolves before a tampered signature is rejected; resolver observations prove each server used only its assigned ingress.
